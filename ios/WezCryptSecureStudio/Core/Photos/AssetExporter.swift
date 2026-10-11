@@ -197,23 +197,16 @@ struct LibraryScanner: Sendable {
         }
         var inserted = Set<String>()
         var deleted = Set<String>()
-        var detailsFailed = false
         do {
             let changes = try PHPhotoLibrary.shared().fetchPersistentChanges(since: token)
-            changes.enumerateChanges { change, stop in
-                do {
-                    let details = try change.changeDetails(for: .asset)
-                    inserted.formUnion(details.insertedLocalIdentifiers)
-                    deleted.formUnion(details.deletedLocalIdentifiers)
-                } catch {
-                    detailsFailed = true
-                    stop.pointee = true
-                }
+            for change in changes {
+                let details = try change.changeDetails(for: PHObjectType.asset)
+                inserted.formUnion(details.insertedLocalIdentifiers)
+                deleted.formUnion(details.deletedLocalIdentifiers)
             }
         } catch {
             throw ScanError.tokenExpired
         }
-        if detailsFailed { throw ScanError.tokenExpired }
         inserted.subtract(deleted)
         var scanned: [ScannedAsset] = []
         if !inserted.isEmpty {

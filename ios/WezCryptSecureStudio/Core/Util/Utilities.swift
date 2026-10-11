@@ -101,7 +101,7 @@ extension Data {
     }
 
     static func bigEndian<T: FixedWidthInteger>(_ value: T) -> Data {
-        withUnsafeBytes(of: value.bigEndian) { Data($0) }
+        Swift.withUnsafeBytes(of: value.bigEndian) { Data($0) }
     }
 
     func readBigEndian<T: FixedWidthInteger>(_ type: T.Type, at offset: Int) -> T {

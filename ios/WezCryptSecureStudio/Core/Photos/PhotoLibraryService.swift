@@ -1,6 +1,7 @@
 import AVFoundation
 import Observation
 import Photos
+import PhotosUI
 import UIKit
 
 /// Photo library authorization and a live fetch of the device library, ordered by
