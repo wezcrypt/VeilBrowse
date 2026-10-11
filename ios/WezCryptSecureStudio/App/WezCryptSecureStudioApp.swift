@@ -6,49 +6,42 @@ import UIKit
 struct WezCryptSecureStudioApp: App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @Environment(\.scenePhase) private var scenePhase
-    private let environment = AppEnvironment.shared
+    private let model = AppModel.shared
 
     var body: some Scene {
         WindowGroup {
             RootView()
-                .environment(environment)
+                .environment(model)
                 .tint(Theme.accent)
-                .task { await environment.bootstrap() }
+                .task { await model.bootstrap() }
         }
-        .onChange(of: scenePhase) { _, phase in
-            environment.handleScenePhase(phase)
-        }
+        .onChange(of: scenePhase) { _, phase in model.handleScenePhase(phase) }
     }
 }
 
 final class AppDelegate: NSObject, UIApplicationDelegate {
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
-        // BGTask handlers must be registered before launch completes.
-        BackgroundSyncScheduler.register { task in
+        BackgroundScheduler.register { task in
             let box = UncheckedSendable(task)
             Task { @MainActor in
-                let environment = AppEnvironment.shared
-                guard await environment.credentials.current() != nil, environment.photos.hasAccess else {
+                let model = AppModel.shared
+                guard model.stage == .ready else {
                     box.value.setTaskCompleted(success: true)
                     return
                 }
-                if environment.settings.backgroundSyncEnabled {
-                    BackgroundSyncScheduler.schedule(requiresExternalPower: environment.settings.backgroundRequiresPower)
-                }
-                environment.sync.runBackgroundPass(box.value)
+                await model.engine.configure(api: model.api)
+                model.sync.handle(box.value)
             }
         }
         return true
     }
 
     func application(_ application: UIApplication, handleEventsForBackgroundURLSession identifier: String, completionHandler: @escaping () -> Void) {
-        guard identifier == AppConfig.backgroundUploadSessionIdentifier else {
+        guard identifier == AppConfig.backgroundSessionIdentifier else {
             completionHandler()
             return
         }
         let handler = UncheckedSendable(completionHandler)
-        MainActor.assumeIsolated {
-            AppEnvironment.shared.transport.setBackgroundCompletionHandler { handler.value() }
-        }
+        AppModel.shared.transport.setBackgroundCompletionHandler { handler.value() }
     }
 }

@@ -1,19 +1,19 @@
 [project]
-name = "wezcrypt-mobile"
-version = "1.0.0"
-description = "WezCrypt Secure Studio native iOS app API (additive to the Telegram studio)"
+name = "wezcrypt-backup"
+version = "2.0.0"
+description = "WezCrypt Secure Studio encrypted backup server (client-side encryption only)"
 requires-python = ">=3.10"
-dependencies = ["fastapi>=0.110,<1.0", "uvicorn[standard]>=0.27", "cryptography>=42"]
+dependencies = ["fastapi>=0.110,<1.0", "uvicorn[standard]>=0.27"]
 
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["wezcrypt_mobile*"]
+include = ["wezcrypt_backup*"]
 
 [tool.setuptools.package-data]
-wezcrypt_mobile = ["migrations/*.sql"]
+wezcrypt_backup = ["migrations/*.sql"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

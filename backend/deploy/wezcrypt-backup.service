@@ -1,0 +1,35 @@
+# /etc/systemd/system/wezcrypt-backup.service
+# Independent of the Telegram bot/studio: own user, own port, own data.
+[Unit]
+Description=WezCrypt Secure Studio - encrypted backup API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=wezcrypt-backup
+Group=wezcrypt-backup
+EnvironmentFile=/etc/wezcrypt-backup/backup.env
+WorkingDirectory=/opt/wezcrypt-backup
+ExecStart=/opt/wezcrypt-backup/venv/bin/uvicorn wezcrypt_backup.standalone:app --host 127.0.0.1 --port 8091 --workers 1 --proxy-headers --forwarded-allow-ips 127.0.0.1 --no-server-header --timeout-keep-alive 75
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/wezcrypt/iphone-backups /var/lib/wezcrypt-backup
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

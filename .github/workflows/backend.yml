@@ -21,11 +21,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-      - name: Install
+      - run: pip install -r backend/requirements-dev.txt
+      - run: python -m pytest -q
         working-directory: backend
-        run: pip install -r requirements-dev.txt
-      - name: Test
-        working-directory: backend
-        run: python -m pytest -q
-      - name: Shell syntax
-        run: bash -n backend/deploy/install.sh
+      - run: bash -n backend/deploy/install.sh && bash -n backend/deploy/rollback.sh

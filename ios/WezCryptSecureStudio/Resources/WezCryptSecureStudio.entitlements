@@ -3,13 +3,10 @@
 <plist version="1.0">
 <dict>
 	<!--
-	  Intentionally minimal so the app can be signed with any Apple Developer
-	  account (including Personal Team re-signing):
-	  * Keychain items use the app's default access group (no entitlement needed).
-	  * Secure Enclave keys via CryptoKit need no entitlement.
-	  * Background modes are declared in Info.plist (UIBackgroundModes).
-	  * File protection is applied per file in code (completeUntilFirstUserAuthentication
-	    for sync state, complete for decrypted viewer files).
+	  Intentionally empty so the IPA can be re-signed with any certificate and
+	  provisioning profile (e.g. with KravaSigner). Keychain uses the default
+	  access group, Secure Enclave keys need no entitlement, background modes are
+	  declared in Info.plist, file protection is set per file in code.
 	-->
 </dict>
 </plist>

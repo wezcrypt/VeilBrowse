@@ -7,22 +7,6 @@ struct NetworkStatus: Sendable, Equatable {
     var isCellular = false
     var isExpensive = false
     var isConstrained = false
-
-    func allows(_ policy: SyncPolicy) -> Bool {
-        guard isConnected else { return false }
-        if policy.respectLowDataMode && isConstrained { return false }
-        switch policy.networkMode {
-        case .wifiOnly: return isWiFi && !isExpensive
-        case .wifiAndCellular: return true
-        }
-    }
-
-    func blockReason(_ policy: SyncPolicy) -> String? {
-        if !isConnected { return String(localized: "Waiting for a network connection") }
-        if policy.respectLowDataMode && isConstrained { return String(localized: "Paused by Low Data Mode") }
-        if policy.networkMode == .wifiOnly && (!isWiFi || isExpensive) { return String(localized: "Waiting for Wi‑Fi") }
-        return nil
-    }
 }
 
 /// NWPathMonitor wrapper exposing the current status and an async change stream.
@@ -67,12 +51,11 @@ final class NetworkMonitor: @unchecked Sendable {
         }
     }
 
-    /// Suspends until the policy allows uploads (or the task is cancelled).
-    func waitUntilAllowed(_ policy: SyncPolicy) async throws {
-        if status.allows(policy) { return }
+    /// Suspends until the network status changes (or the task is cancelled).
+    func waitForChange(from current: NetworkStatus) async throws {
         for await update in updates() {
             try Task.checkCancellation()
-            if update.allows(policy) { return }
+            if update != current { return }
         }
         try Task.checkCancellation()
     }

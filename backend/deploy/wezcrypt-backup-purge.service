@@ -1,0 +1,8 @@
+[Unit]
+Description=Expire stale WezCrypt uploads
+
+[Service]
+Type=oneshot
+User=wezcrypt-backup
+EnvironmentFile=/etc/wezcrypt-backup/backup.env
+ExecStart=/opt/wezcrypt-backup/venv/bin/python -m wezcrypt_backup purge

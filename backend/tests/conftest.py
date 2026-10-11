@@ -1,93 +1,137 @@
 from __future__ import annotations
 
-import base64
+import hashlib
 import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec
 from fastapi.testclient import TestClient
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "tools"))
 
-from wezcrypt_mobile import MobileSettings, create_mobile_app  # noqa: E402
-from wezcrypt_mobile.security import refresh_message  # noqa: E402
+from wezcrypt_backup import Settings, create_app  # noqa: E402
+import wzce  # noqa: E402
 
-TELEGRAM_ID = 424242
+PASSWORD = "correct horse battery staple"
+COLLECTION = "iphone-15"
 
 
-def make_settings(tmp_path: Path, **overrides) -> MobileSettings:
+def make_settings(tmp_path: Path, **overrides) -> Settings:
     values = dict(
-        data_dir=tmp_path / "data",
-        master_keys={1: os.urandom(32)},
-        active_key_id=1,
+        storage_root=tmp_path / "iphone-backups",
+        state_dir=tmp_path / "state",
         token_pepper=os.urandom(32),
-        internal_secret="s" * 40,
-        allowed_telegram_ids=frozenset({TELEGRAM_ID, TELEGRAM_ID + 1}),
-        bot_username="wezcrypt_bot",
-        segment_size=64 * 1024,
-        chunk_segments=2,
+        max_chunk_size=1024 * 1024,
+        min_free_bytes=0,
         trust_proxy_headers=False,
     )
     values.update(overrides)
-    return MobileSettings(**values)
-
-
-@dataclass
-class Device:
-    key: ec.EllipticCurvePrivateKey
-    device_id: str
-    access_token: str
-    refresh_token: str
-
-    @property
-    def headers(self) -> dict[str, str]:
-        return {"Authorization": f"Bearer {self.access_token}"}
-
-    def sign_refresh(self, timestamp: int, refresh_token: str | None = None) -> str:
-        token = refresh_token or self.refresh_token
-        signature = self.key.sign(refresh_message(self.device_id, timestamp, token), ec.ECDSA(hashes.SHA256()))
-        return base64.b64encode(signature).decode()
+    return Settings(**values)
 
 
 @pytest.fixture()
-def settings(tmp_path: Path) -> MobileSettings:
+def settings(tmp_path):
     return make_settings(tmp_path)
 
 
 @pytest.fixture()
-def app(settings: MobileSettings):
-    return create_mobile_app(settings)
+def app(settings):
+    application = create_app(settings)
+    application.state.ctx.auth.create_user("alice", PASSWORD)
+    application.state.ctx.auth.create_user("bob", PASSWORD)
+    return application
 
 
 @pytest.fixture()
-def client(app) -> TestClient:
-    return TestClient(app, client=("127.0.0.1", 50000))
+def client(app):
+    return TestClient(app, client=("127.0.0.1", 40000))
 
 
-def public_key_b64(key: ec.EllipticCurvePrivateKey) -> str:
-    der = key.public_key().public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
-    return base64.b64encode(der).decode()
-
-
-def pair_device(client: TestClient, app, telegram_id: int = TELEGRAM_ID, name: str = "Test iPhone") -> Device:
-    key = ec.generate_private_key(ec.SECP256R1())
-    start = client.post(
-        "/api/mobile/pair/start",
-        json={"device_name": name, "device_model": "iPhone15,4", "system_version": "17.5", "public_key": public_key_b64(key)},
-    )
-    assert start.status_code == 200, start.text
-    data = start.json()
-    app.state.mobile.auth.approve_pairing(data["code"], telegram_id)
-    poll = client.post("/api/mobile/pair/poll", json={"pairing_id": data["pairing_id"], "poll_secret": data["poll_secret"]})
-    assert poll.status_code == 200, poll.text
-    session = poll.json()["session"]
-    return Device(key, session["device_id"], session["access_token"], session["refresh_token"])
+def login(client, username="alice", password=PASSWORD) -> dict:
+    response = client.post("/api/v2/auth/login", json={"username": username, "password": password})
+    assert response.status_code == 200, response.text
+    return {"Authorization": f"Bearer {response.json()['token']}"}
 
 
 @pytest.fixture()
-def device(client, app) -> Device:
-    return pair_device(client, app)
+def auth(client):
+    return login(client)
+
+
+@pytest.fixture()
+def keys():
+    return wzce.VaultKeys(os.urandom(32))
+
+
+@dataclass
+class UploadedObject:
+    object_id: str
+    ciphertext: bytes
+    plaintext_sha256: str
+
+
+def encrypt_object(keys, plaintext: bytes, segment_size: int = 64 * 1024) -> UploadedObject:
+    object_id = os.urandom(16)
+    blob = wzce.encrypt_bytes(plaintext, keys.file_wrap, object_id, segment_size)
+    return UploadedObject(object_id.hex(), blob, hashlib.sha256(plaintext).hexdigest())
+
+
+def start_upload(client, auth, obj: UploadedObject, chunk_size: int = 256 * 1024, collection: str = COLLECTION):
+    chunk_count = (len(obj.ciphertext) + chunk_size - 1) // chunk_size
+    body = {
+        "object_id": obj.object_id,
+        "collection": collection,
+        "size_bytes": len(obj.ciphertext),
+        "chunk_size": chunk_size,
+        "chunk_count": chunk_count,
+        "sha256": hashlib.sha256(obj.ciphertext).hexdigest(),
+    }
+    response = client.post("/api/v2/uploads", json=body, headers=auth)
+    assert response.status_code == 200, response.text
+    return response.json(), chunk_size, chunk_count
+
+
+def put_chunk(client, auth, upload_id, obj, index, chunk_size, data: bytes | None = None, sha: str | None = None):
+    chunk = obj.ciphertext[index * chunk_size : (index + 1) * chunk_size] if data is None else data
+    headers = {**auth, "X-Chunk-SHA256": sha or hashlib.sha256(chunk).hexdigest()}
+    return client.put(f"/api/v2/uploads/{upload_id}/chunks/{index}", content=chunk, headers=headers)
+
+
+def upload_object(client, auth, obj: UploadedObject, chunk_size: int = 256 * 1024, collection: str = COLLECTION, order=None) -> dict:
+    session, chunk_size, chunk_count = start_upload(client, auth, obj, chunk_size, collection)
+    if session["status"] == "completed":
+        return session
+    indices = order or list(range(chunk_count))
+    for index in indices:
+        response = put_chunk(client, auth, session["upload_id"], obj, index, chunk_size)
+        assert response.status_code == 200, response.text
+    done = client.post(f"/api/v2/uploads/{session['upload_id']}/complete", headers=auth)
+    assert done.status_code == 200, done.text
+    return done.json()
+
+
+def make_item(client, auth, keys, objects: list[tuple[str, UploadedObject, str]], kind="photo", collection=COLLECTION):
+    """objects: (role, UploadedObject, filename)."""
+    import base64
+    import json
+
+    item_id = os.urandom(16)
+    resources = [
+        {"role": role, "object_id": obj.object_id, "filename": filename, "sha256": obj.plaintext_sha256, "size": 0}
+        for role, obj, filename in objects
+    ]
+    manifest = wzce.encrypt_bytes(json.dumps({"v": 1, "kind": kind, "resources": resources}).encode(), keys.file_wrap, item_id)
+    tag = keys.content_tag(kind, [(r["role"], r["sha256"]) for r in resources if r["role"] != "thumbnail"])
+    body = {
+        "item_id": item_id.hex(),
+        "collection": collection,
+        "content_tag": tag,
+        "kind": kind,
+        "manifest": base64.b64encode(manifest).decode(),
+        "object_ids": [obj.object_id for _, obj, _ in objects],
+    }
+    return client.post("/api/v2/items", json=body, headers=auth), body

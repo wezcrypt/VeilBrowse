@@ -22,12 +22,12 @@
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
-	<key>WZCAPIBaseURL</key>
-	<string>$(WZC_API_BASE_URL)</string>
 	<key>NSPhotoLibraryUsageDescription</key>
-	<string>WezCrypt reads your photos and videos so it can back them up to your private encrypted vault. Nothing is deleted from your iPhone.</string>
+	<string>WezCrypt encrypts your photos and videos on this iPhone and backs them up to your own server. Nothing is deleted from your library.</string>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>WezCrypt restores decrypted photos and videos from your backup into your library.</string>
 	<key>NSFaceIDUsageDescription</key>
-	<string>Face ID keeps your private vault locked when you are not using it.</string>
+	<string>Face ID keeps your encrypted backups and recovery key locked.</string>
 	<key>PHPhotoLibraryPreventAutomaticLimitedAccessAlert</key>
 	<true/>
 	<key>UIBackgroundModes</key>
@@ -44,6 +44,8 @@
 	<dict>
 		<key>NSAllowsArbitraryLoads</key>
 		<false/>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
 	</dict>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
@@ -54,8 +56,6 @@
 	<dict>
 		<key>UIColorName</key>
 		<string>LaunchBackground</string>
-		<key>UIImageRespectsSafeAreaInsets</key>
-		<true/>
 	</dict>
 	<key>UIRequiredDeviceCapabilities</key>
 	<array>
@@ -64,10 +64,10 @@
 	<key>UISupportedInterfaceOrientations</key>
 	<array>
 		<string>UIInterfaceOrientationPortrait</string>
-		<string>UIInterfaceOrientationLandscapeLeft</string>
-		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
 	<key>UIUserInterfaceStyle</key>
 	<string>Automatic</string>
+	<key>LSSupportsOpeningDocumentsInPlace</key>
+	<false/>
 </dict>
 </plist>

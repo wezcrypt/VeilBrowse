@@ -1,202 +1,154 @@
-import base64
 import hashlib
 import os
 
-from conftest import Device, pair_device
-
-SEG = 64 * 1024
-CHUNK = 2 * SEG
+import wzce
+from conftest import COLLECTION, encrypt_object, login, put_chunk, start_upload, upload_object
 
 
-def checksum(data: bytes) -> str:
-    return "sha256 " + base64.b64encode(hashlib.sha256(data).digest()).decode()
+def test_large_object_roundtrip_out_of_order(client, auth, keys, settings):
+    plaintext = os.urandom(3 * 1024 * 1024 + 4321)
+    obj = encrypt_object(keys, plaintext, segment_size=256 * 1024)
+    session, chunk_size, chunk_count = start_upload(client, auth, obj, chunk_size=512 * 1024)
+    order = list(range(chunk_count))[::-1]
+    for index in order:
+        assert put_chunk(client, auth, session["upload_id"], obj, index, chunk_size).status_code == 200
+    done = client.post(f"/api/v2/uploads/{session['upload_id']}/complete", headers=auth).json()
+    assert done["status"] == "completed"
 
-
-def create(client, device: Device, data: bytes, **extra):
-    body = {
-        "filename": "IMG_0001.HEIC",
-        "mime_type": "image/heic",
-        "media_type": "photo",
-        "size_bytes": len(data),
-        "sha256": hashlib.sha256(data).hexdigest(),
-        "taken_at": 1_700_000_000,
-        "width": 4032,
-        "height": 3024,
-        **extra,
-    }
-    return client.post("/api/mobile/uploads", json=body, headers=device.headers)
-
-
-def upload_all(client, device: Device, data: bytes, **extra) -> dict:
-    session = create(client, device, data, **extra).json()
-    if session["status"] == "duplicate":
-        return session["media"]
-    offset = session["offset"]
-    while offset < len(data):
-        chunk = data[offset : offset + session["chunk_size"]]
-        r = client.patch(
-            f"/api/mobile/uploads/{session['upload_id']}",
-            content=chunk,
-            headers={**device.headers, "Upload-Offset": str(offset), "Upload-Checksum": checksum(chunk)},
-        )
-        assert r.status_code == 200, r.text
-        offset = r.json()["offset"]
-    done = client.post(f"/api/mobile/uploads/{session['upload_id']}/complete", headers=device.headers)
-    assert done.status_code == 200, done.text
-    return done.json()["media"]
-
-
-def test_chunked_upload_roundtrip_and_ranges(client, app, device):
-    data = os.urandom(5 * SEG + 1234)
-    media = upload_all(client, device, data)
-    assert media["size_bytes"] == len(data)
-    assert media["taken_at"] == 1_700_000_000
-
-    full = client.get(f"/api/mobile/media/{media['id']}/content", headers=device.headers)
+    full = client.get(f"/api/v2/objects/{obj.object_id}", headers=auth)
     assert full.status_code == 200
-    assert full.content == data
-    assert full.headers["accept-ranges"] == "bytes"
+    assert full.headers["x-content-sha256"] == hashlib.sha256(obj.ciphertext).hexdigest()
+    assert wzce.decrypt_bytes(full.content, keys.file_wrap, bytes.fromhex(obj.object_id)) == plaintext
 
-    partial = client.get(f"/api/mobile/media/{media['id']}/content", headers={**device.headers, "Range": "bytes=70000-200000"})
-    assert partial.status_code == 206
-    assert partial.content == data[70000:200001]
-    assert partial.headers["content-range"] == f"bytes 70000-200000/{len(data)}"
+    part = client.get(f"/api/v2/objects/{obj.object_id}", headers={**auth, "Range": "bytes=100-1099"})
+    assert part.status_code == 206 and part.content == obj.ciphertext[100:1100]
+    head = client.head(f"/api/v2/objects/{obj.object_id}", headers=auth)
+    assert head.status_code == 200 and int(head.headers["content-length"]) == len(obj.ciphertext)
 
-    suffix = client.get(f"/api/mobile/media/{media['id']}/content", headers={**device.headers, "Range": "bytes=-100"})
-    assert suffix.content == data[-100:]
-
-    bad = client.get(f"/api/mobile/media/{media['id']}/content", headers={**device.headers, "Range": f"bytes={len(data)}-"})
-    assert bad.status_code == 416
-
-    # No plaintext remains in the upload directory and the object is encrypted at rest.
-    settings = app.state.mobile.settings
-    assert list(settings.upload_dir.iterdir()) == []
-    stored = next(settings.storage_dir.rglob("*.wzc2")).read_bytes()
-    assert stored[:4] == b"WZC2"
-    assert data[:4096] not in stored
+    stored = next(settings.storage_root.rglob("*.wzce"))
+    assert stored.relative_to(settings.storage_root).parts[:3] == ("alice", COLLECTION, "objects")
+    assert plaintext[:4096] not in stored.read_bytes()
+    assert list((settings.storage_root / ".uploads").iterdir()) == []
 
 
-def test_duplicate_detection(client, device):
-    data = os.urandom(1000)
-    first = upload_all(client, device, data)
-    again = create(client, device, data).json()
-    assert again["status"] == "duplicate"
-    assert again["media"]["id"] == first["id"]
-    check = client.post("/api/mobile/sync/check", json={"sha256": [hashlib.sha256(data).hexdigest(), "0" * 64]}, headers=device.headers)
-    assert check.json()["existing"] == {hashlib.sha256(data).hexdigest(): first["id"]}
-
-
-def test_resume_after_interruption(client, device):
-    data = os.urandom(3 * CHUNK + 10)
-    session = create(client, device, data).json()
-    upload_id = session["upload_id"]
-    chunk = data[:CHUNK]
-    client.patch(f"/api/mobile/uploads/{upload_id}", content=chunk, headers={**device.headers, "Upload-Offset": "0", "Upload-Checksum": checksum(chunk)})
-
-    # Client restarts: creating the same upload resumes the session.
-    resumed = create(client, device, data).json()
-    assert resumed["upload_id"] == upload_id
-    assert resumed["offset"] == CHUNK
-    assert client.get(f"/api/mobile/uploads/{upload_id}", headers=device.headers).json()["offset"] == CHUNK
-
-    # Re-sending the old chunk is rejected with the current offset.
-    stale = client.patch(f"/api/mobile/uploads/{upload_id}", content=chunk, headers={**device.headers, "Upload-Offset": "0", "Upload-Checksum": checksum(chunk)})
-    assert stale.status_code == 409
-    assert stale.json()["error"]["offset"] == CHUNK
-
-    offset = CHUNK
-    while offset < len(data):
-        part = data[offset : offset + CHUNK]
-        r = client.patch(f"/api/mobile/uploads/{upload_id}", content=part, headers={**device.headers, "Upload-Offset": str(offset), "Upload-Checksum": checksum(part)})
-        offset = r.json()["offset"]
-    media = client.post(f"/api/mobile/uploads/{upload_id}/complete", headers=device.headers).json()["media"]
-    assert client.get(f"/api/mobile/media/{media['id']}/content", headers=device.headers).content == data
-
-
-def test_resume_from_another_device_of_same_user(client, app, device):
-    data = os.urandom(CHUNK + 5)
-    session = create(client, device, data).json()
-    other = pair_device(client, app, name="second")
-    resumed = create(client, other, data).json()
+def test_interrupted_upload_resumes(client, auth, keys):
+    obj = encrypt_object(keys, os.urandom(1_500_000))
+    session, chunk_size, chunk_count = start_upload(client, auth, obj)
+    for index in (0, 2):
+        put_chunk(client, auth, session["upload_id"], obj, index, chunk_size)
+    # The app restarts: creating the same object returns the same session and the received chunks.
+    resumed, _, _ = start_upload(client, auth, obj)
     assert resumed["upload_id"] == session["upload_id"]
+    assert [c["index"] for c in resumed["received"]] == [0, 2]
+    early = client.post(f"/api/v2/uploads/{session['upload_id']}/complete", headers=auth)
+    assert early.status_code == 409 and early.json()["error"]["missing"] == [i for i in range(chunk_count) if i not in (0, 2)]
+    for index in range(chunk_count):
+        if index not in (0, 2):
+            put_chunk(client, auth, session["upload_id"], obj, index, chunk_size)
+    assert client.post(f"/api/v2/uploads/{session['upload_id']}/complete", headers=auth).status_code == 200
+    # Uploading the same object again is a no-op.
+    again, _, _ = start_upload(client, auth, obj)
+    assert again["status"] == "completed"
 
 
-def test_chunk_validation(client, device):
-    data = os.urandom(CHUNK + 100)
-    upload_id = create(client, device, data).json()["upload_id"]
-    url = f"/api/mobile/uploads/{upload_id}"
-
-    no_sum = client.patch(url, content=data[:SEG], headers={**device.headers, "Upload-Offset": "0"})
-    assert no_sum.json()["error"]["code"] == "checksum_required"
-
-    wrong_sum = client.patch(url, content=data[:SEG], headers={**device.headers, "Upload-Offset": "0", "Upload-Checksum": checksum(b"x")})
-    assert wrong_sum.json()["error"]["code"] == "checksum_mismatch"
-
-    misaligned = data[:1000]
-    r = client.patch(url, content=misaligned, headers={**device.headers, "Upload-Offset": "0", "Upload-Checksum": checksum(misaligned)})
-    assert r.json()["error"]["code"] == "chunk_alignment"
-
-    too_big = data[: CHUNK + 100]
-    r = client.patch(url, content=too_big, headers={**device.headers, "Upload-Offset": "0", "Upload-Checksum": checksum(too_big)})
-    assert r.status_code == 413
-
-    early = client.post(f"{url}/complete", headers=device.headers)
-    assert early.json()["error"]["code"] == "upload_incomplete"
+def test_chunk_retry_is_idempotent_and_conflicts_detected(client, auth, keys):
+    obj = encrypt_object(keys, os.urandom(600_000))
+    session, chunk_size, _ = start_upload(client, auth, obj)
+    first = put_chunk(client, auth, session["upload_id"], obj, 0, chunk_size)
+    retry = put_chunk(client, auth, session["upload_id"], obj, 0, chunk_size)
+    assert first.json()["status"] == "received" and retry.json()["status"] == "already_received"
+    other = os.urandom(chunk_size)
+    conflict = put_chunk(client, auth, session["upload_id"], obj, 0, chunk_size, data=other)
+    assert conflict.status_code == 409 and conflict.json()["error"]["code"] == "chunk_conflict"
 
 
-def test_hash_mismatch_fails_upload(client, device):
-    data = os.urandom(500)
-    session = create(client, device, data, sha256="a" * 64).json()
-    r = client.patch(f"/api/mobile/uploads/{session['upload_id']}", content=data, headers={**device.headers, "Upload-Offset": "0", "Upload-Checksum": checksum(data)})
-    assert r.status_code == 200
-    done = client.post(f"/api/mobile/uploads/{session['upload_id']}/complete", headers=device.headers)
-    assert done.status_code == 422
-    assert done.json()["error"]["code"] == "hash_mismatch"
+def test_corrupted_chunk_rejected(client, auth, keys):
+    obj = encrypt_object(keys, os.urandom(600_000))
+    session, chunk_size, _ = start_upload(client, auth, obj)
+    good = obj.ciphertext[:chunk_size]
+    corrupted = bytearray(good)
+    corrupted[10] ^= 1
+    bad = put_chunk(client, auth, session["upload_id"], obj, 0, chunk_size, data=bytes(corrupted), sha=hashlib.sha256(good).hexdigest())
+    assert bad.status_code == 400 and bad.json()["error"]["code"] == "checksum_mismatch"
+    no_hash = client.put(f"/api/v2/uploads/{session['upload_id']}/chunks/0", content=good, headers=auth)
+    assert no_hash.json()["error"]["code"] == "checksum_required"
+    wrong_size = put_chunk(client, auth, session["upload_id"], obj, 0, chunk_size, data=good[:-1])
+    assert wrong_size.status_code == 400
+    out_of_range = put_chunk(client, auth, session["upload_id"], obj, 99, chunk_size, data=good)
+    assert out_of_range.json()["error"]["code"] == "invalid_chunk_index"
 
 
-def test_empty_file_upload(client, device):
-    session = create(client, device, b"", filename="empty.png", mime_type="image/png").json()
-    done = client.post(f"/api/mobile/uploads/{session['upload_id']}/complete", headers=device.headers)
-    assert done.status_code == 200, done.text
-    media = done.json()["media"]
-    assert client.get(f"/api/mobile/media/{media['id']}/content", headers=device.headers).content == b""
+def test_object_hash_mismatch_at_completion(client, auth, keys):
+    obj = encrypt_object(keys, os.urandom(300_000))
+    chunk_size = 256 * 1024
+    body = {"object_id": obj.object_id, "collection": COLLECTION, "size_bytes": len(obj.ciphertext), "chunk_size": chunk_size,
+            "chunk_count": 2, "sha256": "0" * 64}
+    session = client.post("/api/v2/uploads", json=body, headers=auth).json()
+    for index in range(2):
+        put_chunk(client, auth, session["upload_id"], obj, index, chunk_size)
+    done = client.post(f"/api/v2/uploads/{session['upload_id']}/complete", headers=auth)
+    assert done.status_code == 422 and done.json()["error"]["code"] == "object_hash_mismatch"
+    assert client.get(f"/api/v2/objects/{obj.object_id}", headers=auth).status_code == 404
 
 
-def test_size_limit_and_mime_validation(client, device):
-    huge = client.post(
-        "/api/mobile/uploads",
-        json={"filename": "big.mov", "mime_type": "video/quicktime", "media_type": "video", "size_bytes": 10**15, "sha256": "b" * 64},
-        headers=device.headers,
-    )
-    assert huge.status_code == 413
-    wrong = client.post(
-        "/api/mobile/uploads",
-        json={"filename": "a.mov", "mime_type": "image/jpeg", "media_type": "video", "size_bytes": 10, "sha256": "c" * 64},
-        headers=device.headers,
-    )
-    assert wrong.json()["error"]["code"] == "invalid_mime_type"
+def test_upload_validation(client, auth):
+    base = {"object_id": "a" * 32, "collection": COLLECTION, "size_bytes": 10, "chunk_size": 4, "chunk_count": 3, "sha256": "b" * 64}
+    assert client.post("/api/v2/uploads", json=base, headers=auth).status_code == 200
+    assert client.post("/api/v2/uploads", json={**base, "object_id": "c" * 32, "chunk_count": 2}, headers=auth).json()["error"]["code"] == "invalid_chunk_count"
+    assert client.post("/api/v2/uploads", json={**base, "object_id": "../" + "a" * 29}, headers=auth).json()["error"]["code"] == "invalid_id"
+    assert client.post("/api/v2/uploads", json={**base, "object_id": "d" * 32, "collection": "../etc"}, headers=auth).json()["error"]["code"] == "invalid_collection"
+    assert client.post("/api/v2/uploads", json={**base, "object_id": "e" * 32, "chunk_size": 64 * 1024 * 1024, "chunk_count": 1}, headers=auth).json()["error"]["code"] == "invalid_chunk_size"
+    assert client.post("/api/v2/uploads", json={**base, "object_id": "f" * 32, "size_bytes": 0, "chunk_count": 0}, headers=auth).status_code == 413
+    assert client.post("/api/v2/uploads", json={**base, "chunk_size": 5, "chunk_count": 2}, headers=auth).json()["error"]["code"] == "upload_mismatch"
 
 
-def test_filename_sanitized(client, device):
-    media = upload_all(client, device, os.urandom(10), filename="../../etc/\x00passwd.jpg", mime_type="image/jpeg")
-    assert media["filename"] == "passwd.jpg"
+def test_cancel_upload(client, auth, keys, settings):
+    obj = encrypt_object(keys, os.urandom(1000))
+    session, chunk_size, _ = start_upload(client, auth, obj)
+    put_chunk(client, auth, session["upload_id"], obj, 0, chunk_size)
+    assert client.delete(f"/api/v2/uploads/{session['upload_id']}", headers=auth).status_code == 204
+    assert not (settings.upload_dir / session["upload_id"]).exists()
+    assert put_chunk(client, auth, session["upload_id"], obj, 0, chunk_size).status_code == 410
 
 
-def test_cancel_upload(client, app, device):
-    data = os.urandom(10)
-    upload_id = create(client, device, data).json()["upload_id"]
-    assert client.delete(f"/api/mobile/uploads/{upload_id}", headers=device.headers).status_code == 204
-    assert not app.state.mobile.store.part_path(upload_id).exists()
-    assert client.patch(
-        f"/api/mobile/uploads/{upload_id}", content=data, headers={**device.headers, "Upload-Offset": "0", "Upload-Checksum": checksum(data)}
-    ).status_code == 410
+def test_quota_and_low_disk(client, app, auth, keys, tmp_path):
+    app.state.ctx.auth.set_quota("alice", 1000)
+    obj = encrypt_object(keys, os.urandom(5000))
+    body = {"object_id": obj.object_id, "collection": COLLECTION, "size_bytes": len(obj.ciphertext), "chunk_size": 1 << 20,
+            "chunk_count": 1, "sha256": hashlib.sha256(obj.ciphertext).hexdigest()}
+    quota = client.post("/api/v2/uploads", json=body, headers=auth)
+    assert quota.status_code == 507 and quota.json()["error"]["code"] == "quota_exceeded"
+    app.state.ctx.auth.set_quota("alice", None)
+    app.state.ctx.service.settings = app.state.ctx.service.settings.__class__(
+        **{**app.state.ctx.service.settings.__dict__, "min_free_bytes": 10**18})
+    low = client.post("/api/v2/uploads", json=body, headers=auth)
+    assert low.status_code == 507 and low.json()["error"]["code"] == "insufficient_storage"
 
 
-def test_users_are_isolated(client, app, device):
-    from conftest import TELEGRAM_ID
+def test_users_are_isolated(client, auth, keys):
+    obj = encrypt_object(keys, os.urandom(2000))
+    upload_object(client, auth, obj)
+    bob = login(client, "bob")
+    assert client.get(f"/api/v2/objects/{obj.object_id}", headers=bob).status_code == 404
+    assert client.delete(f"/api/v2/objects/{obj.object_id}", headers=bob).status_code == 404
+    # Same object id under another user is a separate namespace.
+    session, _, _ = start_upload(client, bob, obj)
+    assert session["status"] == "active"
 
-    media = upload_all(client, device, os.urandom(100))
-    stranger = pair_device(client, app, telegram_id=TELEGRAM_ID + 1)
-    assert client.get(f"/api/mobile/media/{media['id']}", headers=stranger.headers).status_code == 404
-    assert client.get(f"/api/mobile/media/{media['id']}/content", headers=stranger.headers).status_code == 404
-    assert client.get("/api/mobile/library", headers=stranger.headers).json()["items"] == []
+
+def test_delete_unreferenced_object(client, auth, keys, settings):
+    obj = encrypt_object(keys, os.urandom(2000))
+    upload_object(client, auth, obj)
+    assert client.delete(f"/api/v2/objects/{obj.object_id}", headers=auth).status_code == 204
+    assert list(settings.storage_root.rglob("*.wzce")) == []
+
+
+def test_purge_expired_uploads(client, app, auth, keys, settings):
+    import time
+
+    obj = encrypt_object(keys, os.urandom(1000))
+    session, chunk_size, _ = start_upload(client, auth, obj)
+    put_chunk(client, auth, session["upload_id"], obj, 0, chunk_size)
+    app.state.ctx.service.clock = lambda: time.time() + 8 * 86400
+    assert app.state.ctx.service.purge() == 1
+    assert not (settings.upload_dir / session["upload_id"]).exists()

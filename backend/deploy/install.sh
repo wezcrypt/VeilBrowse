@@ -1,59 +1,76 @@
 #!/usr/bin/env bash
-# Installs the native-app API next to the existing studio on Ubuntu 24.04.
-# Idempotent; never touches the existing studio, its database or its files.
+# Installs or upgrades the WezCrypt encrypted backup API on Ubuntu 24.04.
+# Safe by design: backs up every file it touches, never edits the bot/studio,
+# never runs the service as root. Re-runnable.
+#
+#   sudo bash backend/deploy/install.sh            # install / upgrade
+#   sudo bash backend/deploy/install.sh --dry-run  # show what would happen
 set -euo pipefail
 
-APP_DIR=/opt/wezcrypt-mobile
-DATA_DIR=/var/lib/wezcrypt-mobile
-CONF_DIR=/etc/wezcrypt-mobile
-SRC_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+DRY_RUN=0
+[[ "${1:-}" == "--dry-run" ]] && DRY_RUN=1
 
-if [[ $EUID -ne 0 ]]; then echo "run as root" >&2; exit 1; fi
+APP_DIR=/opt/wezcrypt-backup
+STATE_DIR=/var/lib/wezcrypt-backup
+STORAGE=/srv/wezcrypt/iphone-backups
+CONF_DIR=/etc/wezcrypt-backup
+SRC="$(cd "$(dirname "$0")/.." && pwd)"
+STAMP="$(date +%Y%m%d-%H%M%S)"
+BACKUP_DIR=/root/wezcrypt-backup-predeploy-$STAMP
 
 log() { printf '[install] %s\n' "$*"; }
+run() { if (( DRY_RUN )); then printf '[dry-run] %s\n' "$*"; else "$@"; fi; }
 
-apt-get install -y --no-install-recommends python3-venv rsync curl >/dev/null
-id wezcrypt-mobile >/dev/null 2>&1 || useradd --system --home "$DATA_DIR" --shell /usr/sbin/nologin wezcrypt-mobile
+[[ $EUID -eq 0 ]] || { echo "run with sudo" >&2; exit 1; }
 
-install -d -m 0755 "$APP_DIR"
-install -d -m 0700 -o wezcrypt-mobile -g wezcrypt-mobile "$DATA_DIR"
-install -d -m 0750 -o root -g wezcrypt-mobile "$CONF_DIR"
-
-log "copying service code"
-rsync -a --delete --exclude tests --exclude '__pycache__' "$SRC_DIR/" "$APP_DIR/src/"
-python3 -m venv "$APP_DIR/venv"
-"$APP_DIR/venv/bin/pip" install --quiet --upgrade pip
-"$APP_DIR/venv/bin/pip" install --quiet "$APP_DIR/src"
-
-if [[ ! -f "$CONF_DIR/master.keys" ]]; then
-  log "generating master keyring (BACK IT UP OFFLINE)"
-  "$APP_DIR/venv/bin/python" -m wezcrypt_mobile generate-key "$CONF_DIR/master.keys"
+log "pre-deploy backup -> $BACKUP_DIR"
+run install -d -m 0700 "$BACKUP_DIR"
+backup_copy() { [[ -e "$1" ]] && run cp -a "$1" "$BACKUP_DIR/$2" || true; }
+backup_copy "$APP_DIR" opt-wezcrypt-backup
+backup_copy "$CONF_DIR" etc-wezcrypt-backup
+backup_copy /etc/systemd/system/wezcrypt-backup.service wezcrypt-backup.service
+backup_copy /etc/nginx/sites-enabled nginx-sites-enabled
+backup_copy /etc/nginx/sites-available nginx-sites-available
+backup_copy /etc/nginx/conf.d nginx-conf.d
+if [[ -f "$STATE_DIR/backup.sqlite3" && -x "$APP_DIR/venv/bin/python" ]]; then
+  log "backing up database"
+  run sudo -u wezcrypt-backup env $(grep -v '^#' "$CONF_DIR/backup.env" | xargs) "$APP_DIR/venv/bin/python" -m wezcrypt_backup backup-db "$BACKUP_DIR"
 fi
-if [[ ! -f "$CONF_DIR/internal.secret" ]]; then
-  "$APP_DIR/venv/bin/python" -m wezcrypt_mobile generate-secret "$CONF_DIR/internal.secret"
-fi
-chown wezcrypt-mobile:wezcrypt-mobile "$CONF_DIR/master.keys" "$CONF_DIR/internal.secret"
-chmod 600 "$CONF_DIR/master.keys" "$CONF_DIR/internal.secret"
+(( DRY_RUN )) || echo "$BACKUP_DIR" > /root/wezcrypt-backup-last-predeploy
 
-if [[ ! -f "$CONF_DIR/mobile.env" ]]; then
-  install -m 0600 "$SRC_DIR/deploy/mobile.env.example" "$CONF_DIR/mobile.env"
-  log "edit $CONF_DIR/mobile.env (allowed Telegram ids, bot username) then re-run"
+run apt-get install -y --no-install-recommends python3-venv rsync curl >/dev/null
+id wezcrypt-backup >/dev/null 2>&1 || run useradd --system --home "$STATE_DIR" --shell /usr/sbin/nologin wezcrypt-backup
+run install -d -m 0755 "$APP_DIR"
+run install -d -m 0700 -o wezcrypt-backup -g wezcrypt-backup "$STATE_DIR"
+run install -d -m 0755 /srv/wezcrypt
+run install -d -m 0700 -o wezcrypt-backup -g wezcrypt-backup "$STORAGE"
+run install -d -m 0750 -o root -g wezcrypt-backup "$CONF_DIR"
+
+log "installing code"
+run rsync -a --delete --exclude tests --exclude __pycache__ "$SRC/" "$APP_DIR/src/"
+run python3 -m venv "$APP_DIR/venv"
+run "$APP_DIR/venv/bin/pip" install --quiet --upgrade pip
+run "$APP_DIR/venv/bin/pip" install --quiet "$APP_DIR/src"
+
+if [[ ! -f "$CONF_DIR/backup.env" ]]; then
+  run install -m 0640 -o root -g wezcrypt-backup "$SRC/deploy/backup.env.example" "$CONF_DIR/backup.env"
+fi
+if [[ ! -f "$CONF_DIR/token.pepper" ]]; then
+  run "$APP_DIR/venv/bin/python" -m wezcrypt_backup generate-pepper "$CONF_DIR/token.pepper"
+  run chown wezcrypt-backup:wezcrypt-backup "$CONF_DIR/token.pepper"
 fi
 
-if [[ -f "$DATA_DIR/mobile.sqlite3" ]]; then
-  backup="$DATA_DIR/backups"
-  install -d -m 0700 -o wezcrypt-mobile -g wezcrypt-mobile "$backup"
-  log "backing up database before migrations"
-  sudo -u wezcrypt-mobile env $(grep -v '^#' "$CONF_DIR/mobile.env" | xargs) \
-    "$APP_DIR/venv/bin/python" -m wezcrypt_mobile backup "$backup"
-fi
-sudo -u wezcrypt-mobile env $(grep -v '^#' "$CONF_DIR/mobile.env" | xargs) \
-  "$APP_DIR/venv/bin/python" -m wezcrypt_mobile migrate
+run sudo -u wezcrypt-backup env $(grep -v '^#' "$SRC/deploy/backup.env.example" | xargs) \
+  "$APP_DIR/venv/bin/python" -m wezcrypt_backup migrate
 
-install -m 0644 "$SRC_DIR/deploy/wezcrypt-mobile.service" /etc/systemd/system/wezcrypt-mobile.service
-systemctl daemon-reload
-systemctl enable --now wezcrypt-mobile
-systemctl restart wezcrypt-mobile
-sleep 1
-curl -fsS http://127.0.0.1:8090/api/mobile/health && echo
-log "done. Add deploy/nginx-mobile.conf to the studio server block, run 'nginx -t' and reload nginx."
+run install -m 0644 "$SRC/deploy/wezcrypt-backup.service" /etc/systemd/system/
+run install -m 0644 "$SRC/deploy/wezcrypt-backup-purge.service" /etc/systemd/system/
+run install -m 0644 "$SRC/deploy/wezcrypt-backup-purge.timer" /etc/systemd/system/
+run systemctl daemon-reload
+run systemctl enable --now wezcrypt-backup wezcrypt-backup-purge.timer
+run systemctl restart wezcrypt-backup
+(( DRY_RUN )) || { sleep 1; curl -fsS http://127.0.0.1:8091/api/v2/health; echo; }
+
+log "next: add deploy/nginx-wezcrypt-backup.conf to the studio.rextv.sbs server block, then: nginx -t && systemctl reload nginx"
+log "create your account: sudo -u wezcrypt-backup env \$(cat $CONF_DIR/backup.env | xargs) $APP_DIR/venv/bin/python -m wezcrypt_backup create-user <name>"
+log "rollback: sudo bash $SRC/deploy/rollback.sh"

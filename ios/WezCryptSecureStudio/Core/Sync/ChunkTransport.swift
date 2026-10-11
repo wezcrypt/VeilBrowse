@@ -1,24 +1,31 @@
 import Foundation
 
-/// Uploads chunk files through a background `URLSession`, so a chunk that is in
-/// flight keeps transferring when the app is suspended. The server is the source
-/// of truth for upload offsets, so tasks that complete while the app is not
-/// running are simply reconciled on the next sync pass.
-final class ChunkTransport: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+/// Uploads one prepared chunk file. Implementations must upload from a file on
+/// disk so they work with background URLSessions.
+protocol ChunkTransport: Sendable {
+    func upload(_ request: URLRequest, fromFile fileURL: URL) async throws -> (HTTPURLResponse, Data)
+}
+
+/// Background URLSession transport: chunks that are in flight keep uploading
+/// while the app is suspended. The server is the source of truth for which
+/// chunks arrived, so completions delivered while the app was not running are
+/// reconciled on the next pass (`GET /uploads/{id}`).
+///
+/// iOS cancels background transfers if the user force-quits the app from the
+/// app switcher; they resume (from the last verified chunk) on next launch.
+final class BackgroundChunkTransport: NSObject, ChunkTransport, URLSessionDataDelegate, @unchecked Sendable {
     private struct Pending {
         let continuation: CheckedContinuation<(HTTPURLResponse, Data), Error>
         var data = Data()
-        let fileURL: URL
     }
 
     private let lock = NSLock()
     private var pending: [Int: Pending] = [:]
-    private var orphanData: [Int: Data] = [:]
     private var backgroundCompletion: (@MainActor @Sendable () -> Void)?
     private let identifier: String
-    private var sessionStorage: URLSession?
+    private var storedSession: URLSession?
 
-    init(identifier: String = AppConfig.backgroundUploadSessionIdentifier) {
+    init(identifier: String = AppConfig.backgroundSessionIdentifier) {
         self.identifier = identifier
         super.init()
     }
@@ -26,23 +33,21 @@ final class ChunkTransport: NSObject, URLSessionDataDelegate, @unchecked Sendabl
     private var session: URLSession {
         lock.lock()
         defer { lock.unlock() }
-        if let sessionStorage { return sessionStorage }
+        if let storedSession { return storedSession }
         let configuration = URLSessionConfiguration.background(withIdentifier: identifier)
         configuration.sessionSendsLaunchEvents = true
         configuration.isDiscretionary = false
-        configuration.allowsCellularAccess = true
-        configuration.timeoutIntervalForRequest = 120
-        configuration.timeoutIntervalForResource = 24 * 3600
-        configuration.httpMaximumConnectionsPerHost = 4
+        configuration.timeoutIntervalForRequest = 300
+        configuration.timeoutIntervalForResource = 7 * 24 * 3600
+        configuration.httpMaximumConnectionsPerHost = 8
         configuration.urlCache = nil
         configuration.httpCookieStorage = nil
         configuration.tlsMinimumSupportedProtocolVersion = .TLSv12
         let created = URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
-        sessionStorage = created
+        storedSession = created
         return created
     }
 
-    /// Re-attaches to the background session after a relaunch.
     func activate() {
         _ = session
     }
@@ -56,12 +61,12 @@ final class ChunkTransport: NSObject, URLSessionDataDelegate, @unchecked Sendabl
 
     func upload(_ request: URLRequest, fromFile fileURL: URL) async throws -> (HTTPURLResponse, Data) {
         let task = session.uploadTask(with: request, fromFile: fileURL)
-        task.taskDescription = fileURL.path
+        task.taskDescription = fileURL.lastPathComponent
         let taskID = task.taskIdentifier
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 lock.lock()
-                pending[taskID] = Pending(continuation: continuation, fileURL: fileURL)
+                pending[taskID] = Pending(continuation: continuation)
                 lock.unlock()
                 task.resume()
             }
@@ -70,44 +75,29 @@ final class ChunkTransport: NSObject, URLSessionDataDelegate, @unchecked Sendabl
         }
     }
 
-    // MARK: URLSessionDataDelegate
-
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
         lock.lock()
-        defer { lock.unlock() }
-        if pending[dataTask.taskIdentifier] != nil {
-            pending[dataTask.taskIdentifier]?.data.append(data)
-        } else {
-            orphanData[dataTask.taskIdentifier, default: Data()].append(data)
-        }
+        pending[dataTask.taskIdentifier]?.data.append(data)
+        lock.unlock()
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
         lock.lock()
         let entry = pending.removeValue(forKey: task.taskIdentifier)
-        orphanData.removeValue(forKey: task.taskIdentifier)
         lock.unlock()
-
-        let fileURL = entry?.fileURL ?? task.taskDescription.map { URL(fileURLWithPath: $0) }
-        if let fileURL { try? FileManager.default.removeItem(at: fileURL) }
-
         guard let entry else {
-            Log.sync.info("Background chunk finished while detached; offset will be reconciled")
+            Log.sync.info("Background chunk finished while detached; it will be reconciled with the server")
             return
         }
-        if let error {
-            if let urlError = error as? URLError {
-                entry.continuation.resume(throwing: urlError.code == .cancelled ? CancellationError() : APIError.transport(urlError))
-            } else {
-                entry.continuation.resume(throwing: error)
-            }
-            return
-        }
-        guard let response = task.response as? HTTPURLResponse else {
+        if let urlError = error as? URLError {
+            entry.continuation.resume(throwing: urlError.code == .cancelled ? CancellationError() : APIError.transport(urlError))
+        } else if let error {
+            entry.continuation.resume(throwing: error)
+        } else if let response = task.response as? HTTPURLResponse {
+            entry.continuation.resume(returning: (response, entry.data))
+        } else {
             entry.continuation.resume(throwing: APIError.invalidResponse)
-            return
         }
-        entry.continuation.resume(returning: (response, entry.data))
     }
 
     func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {
@@ -117,6 +107,26 @@ final class ChunkTransport: NSObject, URLSessionDataDelegate, @unchecked Sendabl
         lock.unlock()
         if let handler {
             Task { @MainActor in handler() }
+        }
+    }
+}
+
+/// Foreground transport (used by tests and as a fallback).
+final class ForegroundChunkTransport: ChunkTransport {
+    private let session: URLSession
+
+    init(session: URLSession = URLSession(configuration: .ephemeral)) {
+        self.session = session
+    }
+
+    func upload(_ request: URLRequest, fromFile fileURL: URL) async throws -> (HTTPURLResponse, Data) {
+        do {
+            let (data, response) = try await session.upload(for: request, fromFile: fileURL)
+            guard let http = response as? HTTPURLResponse else { throw APIError.invalidResponse }
+            return (http, data)
+        } catch let error as URLError {
+            if error.code == .cancelled { throw CancellationError() }
+            throw APIError.transport(error)
         }
     }
 }

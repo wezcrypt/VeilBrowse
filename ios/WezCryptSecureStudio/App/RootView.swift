@@ -1,74 +1,66 @@
 import SwiftUI
 
 struct RootView: View {
-    @Environment(AppEnvironment.self) private var env
+    @Environment(AppModel.self) private var model
 
     var body: some View {
         ZStack {
-            switch env.auth.state {
-            case .unknown:
-                ZStack {
-                    Theme.background.ignoresSafeArea()
-                    ProgressView()
-                }
-            case .signedOut, .pairing:
-                PairingView()
-                    .transition(.opacity)
-            case .signedIn:
+            if model.stage == .ready {
                 MainTabView()
-                    .transition(.opacity)
+            } else {
+                OnboardingFlow()
             }
-
-            if env.lock.isLocked {
-                LockView()
-                    .transition(.opacity)
-                    .zIndex(2)
-            } else if env.lock.isObscured {
-                PrivacyCoverView()
-                    .zIndex(1)
+            if model.lock.isLocked {
+                LockView().zIndex(2).transition(.opacity)
+            } else if model.lock.isObscured {
+                PrivacyCover().zIndex(1)
             }
         }
-        .animation(.easeInOut(duration: 0.25), value: env.auth.state)
-        .animation(.easeInOut(duration: 0.2), value: env.lock.isLocked)
-        .onChange(of: env.auth.isSignedIn) { wasSignedIn, isSignedIn in
-            if isSignedIn && !wasSignedIn {
-                Task { await env.signedInStartup() }
-            }
-        }
+        .animation(.easeInOut(duration: 0.2), value: model.lock.isLocked)
+        .animation(.easeInOut(duration: 0.25), value: model.stage)
     }
 }
 
 struct MainTabView: View {
-    enum Tab: Hashable {
-        case library, albums, search, transfers, settings
-    }
-
-    @Environment(AppEnvironment.self) private var env
-    @State private var tab: Tab = .library
+    @Environment(AppModel.self) private var model
 
     var body: some View {
-        TabView(selection: $tab) {
-            LibraryView()
-                .tabItem { Label(String(localized: "Library"), systemImage: "photo.on.rectangle.angled") }
-                .tag(Tab.library)
-            AlbumsView()
-                .tabItem { Label(String(localized: "Albums"), systemImage: "rectangle.stack.fill") }
-                .tag(Tab.albums)
-            SearchView(api: env.api)
-                .tabItem { Label(String(localized: "Search"), systemImage: "magnifyingglass") }
-                .tag(Tab.search)
-            TransfersView()
-                .tabItem { Label(String(localized: "Transfers"), systemImage: "arrow.up.arrow.down.circle") }
-                .badge(env.sync.snapshot.counts.failed > 0 ? Text("\(env.sync.snapshot.counts.failed)") : nil)
-                .tag(Tab.transfers)
-            SettingsView()
-                .tabItem { Label(String(localized: "Settings"), systemImage: "gearshape") }
-                .tag(Tab.settings)
+        TabView {
+            DashboardView().tabItem { Label(String(localized: "Dashboard"), systemImage: "gauge.with.dots.needle.67percent") }
+            LibraryView().tabItem { Label(String(localized: "Library"), systemImage: "photo.on.rectangle.angled") }
+            TransfersView().tabItem { Label(String(localized: "Transfers"), systemImage: "arrow.up.arrow.down.circle") }
+                .badge(model.sync.snapshot.counts.failed)
+            SettingsView().tabItem { Label(String(localized: "Settings"), systemImage: "gearshape") }
         }
-        .overlay(alignment: .top) {
-            if let warning = env.startupWarning {
-                ErrorBanner(message: warning).padding()
+    }
+}
+
+struct LockView: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        let lock = model.lock
+        ZStack {
+            Theme.background.ignoresSafeArea()
+            VStack(spacing: 20) {
+                Image(systemName: "lock.shield.fill").font(.system(size: 64)).foregroundStyle(Theme.heroGradient)
+                Text(String(localized: "Locked")).font(.title.bold())
+                Button { Task { await lock.unlock() } } label: { Label(String(localized: "Unlock"), systemImage: lock.biometrySymbol) }
+                    .buttonStyle(PrimaryButtonStyle()).frame(maxWidth: 260)
+                if let error = lock.lastError { Text(error).font(.footnote).foregroundStyle(Theme.danger) }
             }
+            .padding(32)
         }
+        .task { await lock.unlock() }
+    }
+}
+
+struct PrivacyCover: View {
+    var body: some View {
+        ZStack {
+            Theme.background.ignoresSafeArea()
+            Image(systemName: "lock.shield.fill").font(.system(size: 56)).foregroundStyle(Theme.heroGradient)
+        }
+        .accessibilityHidden(true)
     }
 }

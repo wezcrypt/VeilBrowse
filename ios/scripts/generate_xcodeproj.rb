@@ -87,7 +87,7 @@ common = {
   'SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD' => 'NO',
   'CODE_SIGN_STYLE' => 'Automatic',
   'DEVELOPMENT_TEAM' => '',
-  'MARKETING_VERSION' => '1.0.0',
+  'MARKETING_VERSION' => '2.0.0',
   'CURRENT_PROJECT_VERSION' => '1',
   'ENABLE_USER_SCRIPT_SANDBOXING' => 'YES',
   'SWIFT_EMIT_LOC_STRINGS' => 'YES',
@@ -106,7 +106,6 @@ app.build_configurations.each do |config|
     'ASSETCATALOG_COMPILER_APPICON_NAME' => 'AppIcon',
     'ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME' => 'AccentColor',
     'LD_RUNPATH_SEARCH_PATHS' => ['$(inherited)', '@executable_path/Frameworks'],
-    'WZC_API_BASE_URL' => 'https://studio.rextv.sbs',
     'ENABLE_PREVIEWS' => 'YES'
   )
   config.build_settings['SWIFT_COMPILATION_MODE'] = 'wholemodule' if config.name == 'Release'

@@ -12,9 +12,9 @@ final class AppLockController {
     private(set) var isAuthenticating = false
     private(set) var lastError: String?
     private var backgroundedAt: Date?
-    private let settings: AppSettings
+    private let settings: SecuritySettings
 
-    init(settings: AppSettings) {
+    init(settings: SecuritySettings) {
         self.settings = settings
     }
 
