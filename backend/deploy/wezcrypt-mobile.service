@@ -1,0 +1,37 @@
+# /etc/systemd/system/wezcrypt-mobile.service
+# Separate process from the existing studio: the Telegram Mini App keeps running unchanged.
+[Unit]
+Description=WezCrypt Secure Studio - native iOS app API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=wezcrypt-mobile
+Group=wezcrypt-mobile
+WorkingDirectory=/opt/wezcrypt-mobile
+EnvironmentFile=/etc/wezcrypt-mobile/mobile.env
+# Single worker: rate limiting and upload locks are in-process.
+ExecStart=/opt/wezcrypt-mobile/venv/bin/uvicorn wezcrypt_mobile.standalone:app --host 127.0.0.1 --port 8090 --workers 1 --proxy-headers --forwarded-allow-ips 127.0.0.1 --no-server-header
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/wezcrypt-mobile
+# Add the legacy studio paths here ONLY if legacy hooks need to read WZC1 files, e.g.:
+# ReadOnlyPaths=/opt/wezcrypt-studio
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

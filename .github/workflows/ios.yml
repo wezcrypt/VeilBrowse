@@ -1,0 +1,249 @@
+name: iOS
+
+on:
+  push:
+    paths: ["ios/**", ".github/workflows/ios.yml"]
+  pull_request:
+    paths: ["ios/**", ".github/workflows/ios.yml"]
+  workflow_dispatch:
+    inputs:
+      export_method:
+        description: "IPA export method (requires signing secrets)"
+        type: choice
+        default: ad-hoc
+        options: [ad-hoc, development, app-store-connect]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PROJECT: ios/WezCryptSecureStudio.xcodeproj
+  SCHEME: WezCryptSecureStudio
+
+jobs:
+  test:
+    name: Build & test (simulator)
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+
+      - name: Pick simulator
+        id: sim
+        run: echo "udid=$(python3 ios/scripts/pick_simulator.py --verbose)" >> "$GITHUB_OUTPUT"
+
+      - name: Unit & UI tests
+        run: |
+          if ! xcodebuild test \
+              -project "$PROJECT" -scheme "$SCHEME" \
+              -destination "id=${{ steps.sim.outputs.udid }}" \
+              -resultBundlePath TestResults.xcresult \
+              CODE_SIGNING_ALLOWED=NO > xcodebuild-test.log 2>&1; then
+            echo "::group::Errors"; grep -E "error:|failed|Fatal" xcodebuild-test.log | sort -u | head -200; echo "::endgroup::"
+            tail -60 xcodebuild-test.log
+            exit 1
+          fi
+          grep -E "warning: .*(Sendable|isolat|concurren)" xcodebuild-test.log | sort -u | head -50 || true
+          grep -E "Test Case .*(passed|failed)|Executed [0-9]+ test" xcodebuild-test.log | tail -100
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: |
+            TestResults.xcresult
+            xcodebuild-test.log
+          retention-days: 7
+
+  unsigned-build:
+    name: Device build (unsigned)
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Build for iOS devices without signing
+        run: |
+          if ! xcodebuild build \
+              -project "$PROJECT" -scheme "$SCHEME" \
+              -configuration Release -sdk iphoneos -destination "generic/platform=iOS" \
+              -derivedDataPath build \
+              CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" > xcodebuild-device.log 2>&1; then
+            grep -E "error:" xcodebuild-device.log | sort -u | head -200
+            tail -40 xcodebuild-device.log
+            exit 1
+          fi
+          tail -5 xcodebuild-device.log
+
+      - name: Package unsigned IPA
+        run: |
+          APP="build/Build/Products/Release-iphoneos/WezCryptSecureStudio.app"
+          test -d "$APP"
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -qry WezCryptSecureStudio-UNSIGNED.ipa Payload
+          echo "This IPA is NOT signed. iOS will refuse to install it until it is re-signed with a valid Apple certificate and provisioning profile." > UNSIGNED-README.txt
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: WezCryptSecureStudio-unsigned
+          path: |
+            WezCryptSecureStudio-UNSIGNED.ipa
+            UNSIGNED-README.txt
+          retention-days: 7
+
+  signed-ipa:
+    name: Signed IPA
+    needs: test
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      HAS_SIGNING: ${{ secrets.IOS_CERTIFICATE_P12_BASE64 != '' && secrets.IOS_PROVISIONING_PROFILE_BASE64 != '' && secrets.IOS_TEAM_ID != '' }}
+      EXPORT_METHOD: ${{ github.event.inputs.export_method || vars.IOS_EXPORT_METHOD || 'ad-hoc' }}
+    steps:
+      - name: Signing secrets missing
+        if: env.HAS_SIGNING != 'true'
+        run: |
+          echo "::notice::Signing secrets are not configured; skipping the signed IPA. See docs/SIGNING_AND_INSTALL.md."
+
+      - uses: actions/checkout@v4
+        if: env.HAS_SIGNING == 'true'
+
+      - name: Select Xcode
+        if: env.HAS_SIGNING == 'true'
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Install certificate and profile
+        if: env.HAS_SIGNING == 'true'
+        env:
+          P12_BASE64: ${{ secrets.IOS_CERTIFICATE_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+          PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 32)"
+          echo "::add-mask::$KEYCHAIN_PASSWORD"
+          echo "$P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          echo "$PROFILE_BASE64" | base64 --decode > "$RUNNER_TEMP/profile.mobileprovision"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+          security cms -D -i "$RUNNER_TEMP/profile.mobileprovision" > "$RUNNER_TEMP/profile.plist"
+          PROFILE_UUID=$(/usr/libexec/PlistBuddy -c "Print UUID" "$RUNNER_TEMP/profile.plist")
+          PROFILE_APP_ID=$(/usr/libexec/PlistBuddy -c "Print Entitlements:application-identifier" "$RUNNER_TEMP/profile.plist")
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          cp "$RUNNER_TEMP/profile.mobileprovision" "$HOME/Library/MobileDevice/Provisioning Profiles/$PROFILE_UUID.mobileprovision"
+          echo "PROFILE_UUID=$PROFILE_UUID" >> "$GITHUB_ENV"
+          echo "BUNDLE_ID=${PROFILE_APP_ID#*.}" >> "$GITHUB_ENV"
+          echo "KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
+
+      - name: Archive
+        if: env.HAS_SIGNING == 'true'
+        env:
+          TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
+        run: |
+          if [ "$EXPORT_METHOD" = "development" ]; then IDENTITY="Apple Development"; else IDENTITY="Apple Distribution"; fi
+          if ! xcodebuild archive \
+            -project "$PROJECT" -scheme "$SCHEME" \
+            -configuration Release -destination "generic/platform=iOS" \
+            -archivePath build/WezCryptSecureStudio.xcarchive \
+            CODE_SIGN_STYLE=Manual \
+            DEVELOPMENT_TEAM="$TEAM_ID" \
+            PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
+            PROVISIONING_PROFILE_SPECIFIER="$PROFILE_UUID" \
+            CODE_SIGN_IDENTITY="$IDENTITY" \
+            OTHER_CODE_SIGN_FLAGS="--keychain $KEYCHAIN" \
+            CURRENT_PROJECT_VERSION="${{ github.run_number }}" > xcodebuild-archive.log 2>&1; then
+            grep -E "error:" xcodebuild-archive.log | sort -u | head -100
+            tail -40 xcodebuild-archive.log
+            exit 1
+          fi
+          tail -5 xcodebuild-archive.log
+
+      - name: Export IPA
+        if: env.HAS_SIGNING == 'true'
+        env:
+          TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>${EXPORT_METHOD}</string>
+            <key>teamID</key><string>${TEAM_ID}</string>
+            <key>signingStyle</key><string>manual</string>
+            <key>provisioningProfiles</key>
+            <dict><key>${BUNDLE_ID}</key><string>${PROFILE_UUID}</string></dict>
+            <key>stripSwiftSymbols</key><true/>
+            <key>thinning</key><string>&lt;none&gt;</string>
+          </dict>
+          </plist>
+          PLIST
+          xcodebuild -exportArchive \
+            -archivePath build/WezCryptSecureStudio.xcarchive \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            -exportPath build/export
+          ls -la build/export
+
+      - name: Upload signed IPA
+        if: env.HAS_SIGNING == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: WezCryptSecureStudio-signed-${{ env.EXPORT_METHOD }}
+          path: build/export/*.ipa
+          retention-days: 7
+
+      - name: Upload to TestFlight
+        if: env.HAS_SIGNING == 'true' && env.EXPORT_METHOD == 'app-store-connect'
+        env:
+          ASC_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          ASC_KEY_P8_BASE64: ${{ secrets.APP_STORE_CONNECT_KEY_P8_BASE64 }}
+        run: |
+          set -euo pipefail
+          if [ -z "$ASC_KEY_ID" ] || [ -z "$ASC_ISSUER_ID" ] || [ -z "$ASC_KEY_P8_BASE64" ]; then
+            echo "::notice::App Store Connect API key not configured; skipping TestFlight upload."
+            exit 0
+          fi
+          mkdir -p "$HOME/.appstoreconnect/private_keys"
+          echo "$ASC_KEY_P8_BASE64" | base64 --decode > "$HOME/.appstoreconnect/private_keys/AuthKey_${ASC_KEY_ID}.p8"
+          xcrun altool --upload-app -t ios -f build/export/*.ipa --apiKey "$ASC_KEY_ID" --apiIssuer "$ASC_ISSUER_ID"
+
+      - name: Clean up keychain
+        if: always() && env.HAS_SIGNING == 'true'
+        run: |
+          security delete-keychain "$RUNNER_TEMP/signing.keychain-db" || true
+          rm -f "$RUNNER_TEMP/profile.mobileprovision" "$RUNNER_TEMP/profile.plist"
+          rm -rf "$HOME/.appstoreconnect/private_keys"

@@ -1,0 +1,30 @@
+# Xcode
+build/
+DerivedData/
+*.xcarchive
+*.ipa
+*.dSYM.zip
+*.xcresult
+xcuserdata/
+*.xcuserstate
+Payload/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+
+# Secrets — never commit signing material or server keys
+*.p12
+*.mobileprovision
+*.p8
+*.keys
+*.secret
+*.pepper
+mobile.env
+
+# Distribution
+dist/
+.DS_Store

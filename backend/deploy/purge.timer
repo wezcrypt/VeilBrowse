@@ -1,0 +1,10 @@
+# /etc/systemd/system/wezcrypt-mobile-purge.timer
+[Unit]
+Description=Purge expired WezCrypt mobile upload parts hourly
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+
+[Install]
+WantedBy=timers.target

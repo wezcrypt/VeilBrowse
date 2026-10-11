@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  Intentionally minimal so the app can be signed with any Apple Developer
+	  account (including Personal Team re-signing):
+	  * Keychain items use the app's default access group (no entitlement needed).
+	  * Secure Enclave keys via CryptoKit need no entitlement.
+	  * Background modes are declared in Info.plist (UIBackgroundModes).
+	  * File protection is applied per file in code (completeUntilFirstUserAuthentication
+	    for sync state, complete for decrypted viewer files).
+	-->
+</dict>
+</plist>

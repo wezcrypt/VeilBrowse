@@ -1,0 +1,9 @@
+# /etc/systemd/system/wezcrypt-mobile-purge.service
+[Unit]
+Description=Purge expired WezCrypt mobile upload parts
+
+[Service]
+Type=oneshot
+User=wezcrypt-mobile
+EnvironmentFile=/etc/wezcrypt-mobile/mobile.env
+ExecStart=/opt/wezcrypt-mobile/venv/bin/python -m wezcrypt_mobile purge
