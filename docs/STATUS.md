@@ -37,6 +37,30 @@ This file separates **written**, **tested in CI** and **not tested**. Nothing he
 - Unsigned: it must be signed (e.g. KravaSigner) before installation. Installing on a device has not been tested from here.
 | Backend #3 | ✅ | pytest on Python 3.12 and 3.13 |
 
+## Version 2.1.0 (upload stability, viewer, player)
+
+| Run | Result | Notes |
+|---|---|---|
+| iOS 38286470118 | IPA ✅ · tests ❌ | one test compile error (`await` inside `XCTUnwrap`), fixed |
+| iOS 38287342661 | ✅ | viewer/player/cache commit |
+| iOS 38288733996 | IPA ✅ · tests ❌ | Swift 6 isolation error in a new `@MainActor` test, fixed |
+| iOS 38290648073 (`a2c6116`) | ✅ | **57 passed, 0 failed, 1 skipped** (PhotoKit: simulator Photos permission) |
+| Backend (pytest, local + CI) | ✅ | **58 passed** |
+
+Measured in CI (simulator + real backend on loopback):
+- 1,000 files backed up through the full engine in 57 s, peak 4 parallel uploads (the global limit), 0 failures, 0 open server sessions afterwards, every file sent exactly once, restores SHA-256-identical
+- forced HTTP 429 (Retry-After: 2) and 503 (no Retry-After): all files completed, 0 retry attempts used, engine waited instead of hammering
+- ten-minute H.264 video: backed up, decrypted through the encrypted cache, SHA-256 identical, plays, seeks to 5:00, 2× speed, resume position saved
+- 54 MP JPEG decoded to 2,000 px and 5,000 px in 0.75 s
+- encrypting 120 MB grows resident memory by ~0 KB
+
+Root causes fixed in 2.1:
+1. *Too many concurrent uploads*: sessions were opened for every object while encrypting up to 1.5 GB ahead and never cancelled on re-prepare/failure → lazy sessions, cancellation, bounded preparation, server-side reclaim.
+2. *Retry storms*: 429 counted as an item failure and was retried per chunk without delay → shared back-pressure gate with Retry-After, AIMD concurrency, deferrals without attempts.
+3. *Backup stops in the background*: ending background time cancelled background-URLSession uploads → detach instead of cancel, hand-off of ready chunks, reconcile on wake.
+
+Not tested (needs a real iPhone): background hand-off and wake chaining while suspended, Picture in Picture, Live Photo playback from backup, rotation feel, real-network throughput, Face ID, Secure Enclave. Not deployed: the 2.1 backend on studio.rextv.sbs (commands in DEPLOYMENT.md §7).
+
 ## Test coverage map
 
 | Requirement | Test(s) | Where it runs |
