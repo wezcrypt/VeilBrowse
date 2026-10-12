@@ -547,6 +547,22 @@ actor SyncEngine {
                         try await Task.sleep(nanoseconds: UInt64(max(next.timeIntervalSinceNow, 1) * 1_000_000_000))
                         continue
                     }
+                    if !detachedFiles.isEmpty {
+                        // Remaining chunks are being sent by iOS (handed off earlier): wait for
+                        // them and reconcile with the server instead of sending them twice.
+                        setPhase(.waiting(String(localized: "Finishing uploads handed to iOS")))
+                        try await Task.sleep(nanoseconds: 3_000_000_000)
+                        systemInFlightChecked = .distantPast
+                        let current = await transport.inFlightFileNames()
+                        let finished = detachedFiles.subtracting(current)
+                        systemInFlight = current
+                        systemInFlightChecked = Date()
+                        if !finished.isEmpty {
+                            detachedFiles.subtract(finished)
+                            try await reconcile(finishedFiles: finished, api: api)
+                        }
+                        continue
+                    }
                     return
                 }
 
