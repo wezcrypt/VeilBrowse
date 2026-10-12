@@ -158,7 +158,9 @@ class AuthService:
 
     def login(self, username: str, password: str, client_ip: str | None, device_label: str) -> dict:
         key = f"{username.lower()}|{client_ip}"
-        wait = self.login_limiter.check(key)
+        # Only failed attempts count toward the limit; a successful login clears
+        # them, so legitimate clients that sign in often are never locked out.
+        wait = self.login_limiter.blocked(key)
         if wait:
             raise APIError(429, "rate_limited", "Too many login attempts. Try again later.", headers={"Retry-After": str(wait)})
         with self.db.read() as conn:
@@ -167,7 +169,9 @@ class AuthService:
         if row is None or not valid or row["disabled"]:
             with self.db.tx() as conn:
                 self.audit(conn, "login.failed", row["id"] if row else None, None, client_ip)
+            self.login_limiter.record(key)
             raise unauthorized("invalid_credentials", "Incorrect username or password")
+        self.login_limiter.reset(key)
         token = SESSION_PREFIX + secrets.token_urlsafe(32)
         now = self._now()
         expires = now + self.settings.token_ttl

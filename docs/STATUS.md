@@ -23,7 +23,10 @@ This file separates **written**, **tested in CI** and **not tested**. Nothing he
 |---|---|---|
 | iOS #3 (previous session) | ❌ | Swift 6 errors: tuple labels lost in `importFiles`, captured `var` in a `@Sendable` closure in `ResourceExporter` |
 | iOS #4 | IPA ✅ · tests ⏹ | Compile errors fixed; the test job hung in `simctl bootstatus` (runner issue) and was cancelled |
-| iOS #5 | IPA ✅ · tests: see Actions | Simulator boot now bounded (7 min) with one erase-and-retry |
+| iOS #5 | IPA ✅ · tests ⏹ | Superseded by the next push |
+| iOS #6 | IPA ✅ · tests ❌ | 24 passed; 19 failed with `errSecMissingEntitlement (-34018)`: the simulator build was unsigned, so it had no Keychain access |
+| iOS #7 | IPA ✅ · tests ❌ | Ad-hoc signed: Keychain fixed. 4 failed with HTTP 429: the backend counted *successful* logins toward the rate limit (real bug, fixed). PhotoKit test skipped because the Photos grant was applied before install |
+| iOS #8 | see Actions | Rate limiter counts failures only; install → grant Photos → test-without-building |
 | Backend #3 | ✅ | pytest on Python 3.12 and 3.13 |
 
 ## Test coverage map

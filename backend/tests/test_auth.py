@@ -100,3 +100,17 @@ def test_health_and_capabilities_are_public(client):
     assert body["resumable_uploads"] is True
     assert body["max_chunk_bytes"] >= 64 * 1024
     assert "https" in body["transports"]
+
+
+def test_successful_logins_do_not_trigger_rate_limit_and_reset_failures(client):
+    for _ in range(20):
+        assert client.post("/api/v2/auth/login", json={"username": "alice", "password": PASSWORD}).status_code == 200
+    for _ in range(7):
+        assert client.post("/api/v2/auth/login", json={"username": "alice", "password": "wrong-password!"}).status_code == 401
+    assert client.post("/api/v2/auth/login", json={"username": "alice", "password": PASSWORD}).status_code == 200
+    # the success cleared the failure counter: 8 more failures are allowed before 429
+    codes = [client.post("/api/v2/auth/login", json={"username": "alice", "password": "wrong-password!"}).status_code for _ in range(9)]
+    assert codes[:8] == [401] * 8
+    assert codes[8] == 429
+    # while blocked, even the correct password is refused
+    assert client.post("/api/v2/auth/login", json={"username": "alice", "password": PASSWORD}).status_code == 429
