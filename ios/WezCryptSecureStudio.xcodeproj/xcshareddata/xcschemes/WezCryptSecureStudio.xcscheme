@@ -14,7 +14,7 @@
             buildForAnalyzing = "YES">
             <BuildableReference
                BuildableIdentifier = "primary"
-               BlueprintIdentifier = "CC0C63B533478E052F39A93C"
+               BlueprintIdentifier = "C2D86580CBC07AFB81ADF21F"
                BuildableName = "WezCryptSecureStudio.app"
                BlueprintName = "WezCryptSecureStudio"
                ReferencedContainer = "container:WezCryptSecureStudio.xcodeproj">
@@ -30,7 +30,7 @@
       <MacroExpansion>
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "CC0C63B533478E052F39A93C"
+            BlueprintIdentifier = "C2D86580CBC07AFB81ADF21F"
             BuildableName = "WezCryptSecureStudio.app"
             BlueprintName = "WezCryptSecureStudio"
             ReferencedContainer = "container:WezCryptSecureStudio.xcodeproj">
@@ -41,7 +41,7 @@
             skipped = "NO">
             <BuildableReference
                BuildableIdentifier = "primary"
-               BlueprintIdentifier = "681CC1B552022BC127B9735A"
+               BlueprintIdentifier = "B7918246A8F96A81FF18B495"
                BuildableName = "WezCryptSecureStudioTests.xctest"
                BlueprintName = "WezCryptSecureStudioTests"
                ReferencedContainer = "container:WezCryptSecureStudio.xcodeproj">
@@ -51,7 +51,7 @@
             skipped = "NO">
             <BuildableReference
                BuildableIdentifier = "primary"
-               BlueprintIdentifier = "A01FAE100D77A71D4F3EAFA6"
+               BlueprintIdentifier = "8B440506DED551FB2E8766D1"
                BuildableName = "WezCryptSecureStudioUITests.xctest"
                BlueprintName = "WezCryptSecureStudioUITests"
                ReferencedContainer = "container:WezCryptSecureStudio.xcodeproj">
@@ -73,7 +73,7 @@
          runnableDebuggingMode = "0">
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "CC0C63B533478E052F39A93C"
+            BlueprintIdentifier = "C2D86580CBC07AFB81ADF21F"
             BuildableName = "WezCryptSecureStudio.app"
             BlueprintName = "WezCryptSecureStudio"
             ReferencedContainer = "container:WezCryptSecureStudio.xcodeproj">
@@ -90,7 +90,7 @@
          runnableDebuggingMode = "0">
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "CC0C63B533478E052F39A93C"
+            BlueprintIdentifier = "C2D86580CBC07AFB81ADF21F"
             BuildableName = "WezCryptSecureStudio.app"
             BlueprintName = "WezCryptSecureStudio"
             ReferencedContainer = "container:WezCryptSecureStudio.xcodeproj">

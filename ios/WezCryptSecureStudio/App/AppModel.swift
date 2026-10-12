@@ -2,6 +2,7 @@ import CryptoKit
 import Foundation
 import Observation
 import SwiftUI
+import UIKit
 
 /// Composition root and onboarding state machine.
 @MainActor
@@ -38,6 +39,7 @@ final class AppModel {
     let directories: SyncDirectories
 
     private static let onboardedKey = "onboarding.completed.v2"
+    @ObservationIgnored private var lockObserver: NSObjectProtocol?
 
     private init() {
         keychain = KeychainStore()
@@ -110,6 +112,13 @@ final class AppModel {
         await engine.configure(api: api)
         lock.lockOnLaunch(signedIn: stage == .ready)
         AppDirectories.wipe(FileManager.default.temporaryDirectory.appendingPathComponent("Restore"))
+        // Decrypted viewer files never outlive a session: removed at launch and as soon
+        // as the device locks (they are also unreadable then: complete file protection).
+        ViewerFiles.wipeAll()
+        if lockObserver == nil {
+            lockObserver = NotificationCenter.default.addObserver(forName: UIApplication.protectedDataWillBecomeUnavailableNotification,
+                                                                  object: nil, queue: .main) { _ in ViewerFiles.wipeAll() }
+        }
         if stage == .ready {
             await sync.refresh()
             await refreshAccount()
@@ -230,6 +239,8 @@ final class AppModel {
         await engine.configure(api: nil)
         credentials.eraseAll()
         ServerConfiguration.clear()
+        ViewerFiles.wipeAll()
+        await MediaCache.shared.clear()
         UserDefaults.standard.removeObject(forKey: Self.onboardedKey)
         if forgetRecoveryKey { keyVault.erase() }
         BackgroundScheduler.cancel()

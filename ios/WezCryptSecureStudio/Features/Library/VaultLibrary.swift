@@ -12,7 +12,14 @@ final class VaultLibraryModel {
     private(set) var undecryptable = 0
     private(set) var error: String?
     private var cursor: String?
-    private var thumbnails: [String: UIImage] = [:]
+    /// Decoded thumbnails in memory, bounded by pixel memory (~96 MB); the encrypted
+    /// thumbnail files themselves are kept by `MediaCache` on disk.
+    @ObservationIgnored private let thumbnails: NSCache<NSString, UIImage> = {
+        let cache = NSCache<NSString, UIImage>()
+        cache.totalCostLimit = 96 * 1024 * 1024
+        cache.countLimit = 1500
+        return cache
+    }()
     private var thumbnailTasks: [String: Task<UIImage?, Never>] = [:]
 
     var media: [VaultItem] { items.filter { $0.kind != .file } }
@@ -48,7 +55,7 @@ final class VaultLibraryModel {
     }
 
     func thumbnail(for item: VaultItem, model: AppModel) async -> UIImage? {
-        if let cached = thumbnails[item.id] { return cached }
+        if let cached = thumbnails.object(forKey: item.id as NSString) { return cached }
         if let task = thumbnailTasks[item.id] { return await task.value }
         guard let service = try? model.restoreService() else { return nil }
         let task = Task { try? await service.thumbnail(for: item) }
@@ -56,15 +63,15 @@ final class VaultLibraryModel {
         let image = await task.value
         thumbnailTasks[item.id] = nil
         if let image {
-            if thumbnails.count > 600 { thumbnails.removeAll() }
-            thumbnails[item.id] = image
+            let cost = Int(image.size.width * image.scale * image.size.height * image.scale * 4)
+            thumbnails.setObject(image, forKey: item.id as NSString, cost: cost)
         }
         return image
     }
 
     func remove(_ item: VaultItem) {
         items.removeAll { $0.id == item.id }
-        thumbnails[item.id] = nil
+        thumbnails.removeObject(forKey: item.id as NSString)
     }
 }
 
@@ -85,6 +92,8 @@ struct LibraryView: View {
     @State private var library = VaultLibraryModel()
     @State private var section: Section = .photos
     @State private var showRestore = false
+    @State private var viewer: ViewerRequest?
+    @Namespace private var zoomNamespace
 
     private let columns = [GridItem(.adaptive(minimum: 96), spacing: 2)]
 
@@ -127,6 +136,12 @@ struct LibraryView: View {
                 }
             }
             .sheet(isPresented: $showRestore) { RestoreView(library: library) }
+            .fullScreenCover(item: $viewer) { request in
+                MediaViewer(kinds: request.kinds, startID: request.startID, library: library) {
+                    await library.loadMore(model)
+                }
+                .zoomTransitionDestination(id: request.startID, in: zoomNamespace)
+            }
             .refreshable { await library.reload(model) }
             .task { if library.items.isEmpty { await library.reload(model) } }
             .task(id: section) { await fillSection() }
@@ -159,10 +174,13 @@ struct LibraryView: View {
         ScrollView {
             LazyVGrid(columns: columns, spacing: 2) {
                 ForEach(visible) { item in
-                    NavigationLink(value: item.id) {
+                    Button {
+                        viewer = ViewerRequest(kinds: section == .videos ? [.video] : [.photo, .livePhoto], startID: item.id)
+                    } label: {
                         VaultThumbnail(item: item, library: library)
                     }
                     .buttonStyle(.plain)
+                    .zoomTransitionSource(id: item.id, in: zoomNamespace)
                     .task { if item.id == visible.last?.id { await library.loadMore(model) } }
                 }
             }

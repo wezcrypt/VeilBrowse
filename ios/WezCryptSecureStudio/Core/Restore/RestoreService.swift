@@ -66,11 +66,45 @@ struct RestoreService: Sendable {
         return output
     }
 
-    func thumbnail(for item: VaultItem) async throws -> UIImage? {
-        guard let resource = item.manifest.thumbnail else { return nil }
-        let url = try await decrypt(resource)
-        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
-        return ImageDownsampler.downsample(fileURL: url, maxPixelSize: 400)
+    /// Thumbnails come from the encrypted disk cache and are decrypted in memory only.
+    func thumbnail(for item: VaultItem, maxPixelSize: CGFloat = 400) async throws -> UIImage? {
+        guard let resource = item.manifest.thumbnail, let objectID = Data(hexString: resource.objectId) else { return nil }
+        let encrypted = try await MediaCache.shared.encryptedObject(resource.objectId, expectedSize: resource.size + 4096, api: api)
+        let keys = keys
+        return try await Task.detached(priority: .utility) { () -> UIImage? in
+            let plaintext: Data
+            do {
+                plaintext = try WZCE.decrypt(Data(contentsOf: encrypted), kek: keys.fileWrap, expectedObjectID: objectID)
+            } catch {
+                try? FileManager.default.removeItem(at: encrypted)
+                throw error
+            }
+            guard FileHasher.sha256Hex(plaintext) == resource.sha256 else { throw RestoreError.integrity(resource.filename) }
+            return ImageDownsampler.downsample(data: plaintext, maxPixelSize: maxPixelSize)
+        }.value
+    }
+
+    /// Decrypts a resource for viewing into a short-lived protected file (caller deletes
+    /// its folder). The ciphertext comes from the encrypted cache; the plaintext SHA-256
+    /// is verified against the manifest before the file is returned.
+    func viewerFile(_ resource: ItemManifest.Resource, progress: (@Sendable (Double) -> Void)? = nil) async throws -> URL {
+        guard let objectID = Data(hexString: resource.objectId) else { throw WZCE.Failure.malformedHeader }
+        let encrypted = try await MediaCache.shared.encryptedObject(resource.objectId, expectedSize: resource.size * 2 + 65_536, api: api, progress: progress)
+        let folder = try ViewerFiles.newFolder()
+        let output = folder.appendingPathComponent(Self.safeName(resource.filename))
+        let keys = keys
+        do {
+            let sha = try await Task.detached(priority: .userInitiated) {
+                try WZCE.decryptFile(at: encrypted, to: output, kek: keys.fileWrap, expectedObjectID: objectID)
+            }.value
+            guard sha == resource.sha256 else { throw RestoreError.integrity(resource.filename) }
+            return output
+        } catch {
+            try? FileManager.default.removeItem(at: folder)
+            // A damaged cached copy must not be reused: the next attempt downloads it again.
+            if error is WZCE.Failure || error is RestoreError { try? FileManager.default.removeItem(at: encrypted) }
+            throw error
+        }
     }
 
     /// Recreates the asset in Photos with its original resources (Live Photos keep their paired video).

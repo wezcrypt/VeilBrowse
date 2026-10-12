@@ -198,7 +198,8 @@ final class UploadGovernanceIntegrationTests: IntegrationTestCase {
         for index in [0, 499, 999] {
             let (original, localID) = originals[index]
             let name = try await rig.store.asset(localID)?.displayName ?? ""
-            let restored = try XCTUnwrap(try await restoredData(api: api, vault: vault, name: name))
+            let restoredURL = try await restoredData(api: api, vault: vault, name: name)
+            let restored = try XCTUnwrap(restoredURL)
             XCTAssertEqual(try FileHasher.sha256Hex(of: original), try FileHasher.sha256Hex(of: restored), "restored bytes must match the original (SHA-256)")
         }
         // Running again uploads nothing (completed files are never re-sent).
