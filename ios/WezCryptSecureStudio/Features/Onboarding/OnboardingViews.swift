@@ -79,6 +79,7 @@ struct ServerSetupView: View {
     @State private var password = ""
     @State private var apiKey = ""
     @State private var collection = AppConfig.defaultCollection
+    @State private var timeout = ServerConfiguration.defaultTimeout
     @State private var error: String?
     @State private var saving = false
 
@@ -91,10 +92,13 @@ struct ServerSetupView: View {
                 Picker(String(localized: "Connection Protocol"), selection: $transport) {
                     ForEach(TransferProtocol.allCases) { Text($0.title).tag($0) }
                 }
+                Stepper(value: $timeout, in: ServerConfiguration.timeoutRange, step: 10) {
+                    LabeledContent(String(localized: "Connection Timeout"), value: String(localized: "\(timeout) s"))
+                }
             } header: {
                 Text(String(localized: "Server"))
             } footer: {
-                Text(String(localized: "Only HTTPS with a certificate trusted by iOS is accepted."))
+                Text(String(localized: "Only HTTPS with a certificate trusted by iOS is accepted. Include a port in the address if needed, e.g. https://example.com:8443."))
             }
 
             Section(String(localized: "HTTPS Authentication")) {
@@ -153,6 +157,7 @@ struct ServerSetupView: View {
         authMethod = config.authMethod
         username = config.username
         collection = config.collection
+        timeout = config.timeoutSeconds ?? ServerConfiguration.defaultTimeout
     }
 
     private func save() async {
@@ -162,7 +167,8 @@ struct ServerSetupView: View {
             let url = try ServerConfiguration.normalizedURL(serverURL)
             let config = ServerConfiguration(serverURL: url, transport: transport, authMethod: authMethod,
                                              username: username.trimmingCharacters(in: .whitespaces).lowercased(),
-                                             collection: collection.trimmingCharacters(in: .whitespaces))
+                                             collection: collection.trimmingCharacters(in: .whitespaces),
+                                             timeoutSeconds: timeout)
             try await model.saveConfiguration(config, secret: authMethod == .password ? password : apiKey.trimmingCharacters(in: .whitespacesAndNewlines))
             error = nil
             model.go(to: .connectionTest)

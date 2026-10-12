@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Admin CLI wrapper: runs `python -m wezcrypt_backup <command>` as the service
+# user with the service configuration loaded. Installed to /usr/local/sbin.
+#
+#   sudo wezcrypt-backup-admin create-user alice
+#   sudo wezcrypt-backup-admin create-api-key alice --label laptop
+#   sudo wezcrypt-backup-admin users
+set -euo pipefail
+CONF=/etc/wezcrypt-backup/backup.env
+PY=/opt/wezcrypt-backup/venv/bin/python
+[[ $EUID -eq 0 ]] || { echo "run with sudo" >&2; exit 1; }
+[[ -r "$CONF" ]] || { echo "missing $CONF (run install.sh first)" >&2; exit 1; }
+[[ -x "$PY" ]] || { echo "missing $PY (run install.sh first)" >&2; exit 1; }
+mapfile -t ENV_LINES < <(grep -Ev '^\s*(#|$)' "$CONF")
+exec sudo -u wezcrypt-backup env "${ENV_LINES[@]}" "$PY" -m wezcrypt_backup "$@"

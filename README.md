@@ -1,113 +1,91 @@
 # WezCrypt Secure Studio
 
-خزنة صور وفيديوهات خاصة ومشفّرة — تطبيق iPhone أصلي (SwiftUI) متصل بسيرفر WezCrypt.
+نسخ احتياطي **مشفّر طرفيًا** لصور وفيديوهات وملفات iPhone إلى سيرفرك الشخصي — بالجودة الأصلية، بدون أي اعتماد على تيليجرام.
 
 | | |
 |---|---|
 | المطوّر | wezcrypt — https://wezcrypt.com |
-| النظام | iOS 17+ (مُصمَّم لـ iPhone 15) |
-| اللغة / الواجهة | Swift 6 · SwiftUI · PhotoKit · AVFoundation · CryptoKit |
-| السيرفر | `https://studio.rextv.sbs` — FastAPI على Ubuntu 24.04 |
+| المنصة | iPhone · iOS 17+ · Swift 6 · SwiftUI · PhotoKit · CryptoKit |
 | معرّف الحزمة | `com.wezcrypt.securestudio` |
+| السيرفر | `https://studio.rextv.sbs` — FastAPI + SQLite على Ubuntu 24.04 خلف nginx |
+| مجلد النسخ | `iphone-backups` |
+| النقل | HTTPS (رفع مجزّأ قابل للاستكمال) |
 
-> **صراحة أمنية:** التشفير الحالي **تشفير على السيرفر** (AES-256-GCM عند التخزين + HTTPS أثناء النقل). السيرفر يملك المفتاح الرئيسي، لذلك **ليس End-to-End Encrypted**. تصميم التشفير على الجهاز موثّق في [`SECURITY.md`](SECURITY.md) كخيار مستقبلي.
+## الفكرة باختصار
 
----
+- **التشفير يتم على الآيفون قبل الرفع** (AES-256-GCM، مفتاح عشوائي لكل ملف، صيغة WZCE v1 مُوثّقة ومُجزّأة). السيرفر يخزّن نصًا مشفرًا فقط ولا يملك أي مفتاح.
+- **مفتاح الاستعادة** (55 حرفًا) هو أصل كل المفاتيح. محفوظ على الجهاز داخل Keychain ومختوم بمفتاح Secure Enclave، ويمكن إدخاله على iPhone جديد أو على كمبيوتر لاستعادة كل شيء.
+- **الأصل كما هو**: HEIC/JPEG/PNG/RAW/ProRAW، الصور الحية (الصورة + الفيديو المقترن)، RAW+JPEG، MOV/MP4/HEVC/HDR/4K. لا ضغط ولا تحويل.
+- **أسماء الملفات والتواريخ والأبعاد** داخل manifest مشفّر. ما يراه السيرفر موضح في [`SECURITY.md`](SECURITY.md) §6.
+- **لا يُحذف أي شيء من مكتبة الصور** إطلاقًا.
 
 ## محتويات المستودع
 
 ```
-ios/                               تطبيق iPhone
-  WezCryptSecureStudio.xcodeproj   مشروع Xcode (مُولَّد من scripts/generate_xcodeproj.rb)
-  WezCryptSecureStudio/
-    App/                           نقطة الدخول، AppDelegate، تركيب الاعتماديات
-    Core/Auth                      AuthManager — ربط الجهاز عبر بوت تيليجرام
-    Core/Security                  Keychain، مفتاح Secure Enclave، قفل Face ID
-    Core/Crypto                    WZC2 (AES-256-GCM مجزّأ)، SHA-256، RecoveryKit
-    Core/Networking                APIClient (HTTPS فقط) ونماذج الـ API
-    Core/Photos                    PhotoKit: الصلاحيات، التصدير من iCloud، المسح
-    Core/Sync                      Sync All: SyncEngine، SQLite، رفع مجزّأ في الخلفية
-    Core/Media                     تحميل الصور المصغّرة، بث الفيديو بـ HTTP Range
-    Core/Albums                    إدارة الألبومات
-    Features/                      Library · Albums · Search · Transfers · Settings · Viewer
-  WezCryptSecureStudioTests/       اختبارات وحدة (تشمل توافق WZC2 مع بايثون بايتًا ببايت)
-  WezCryptSecureStudioUITests/     اختبار واجهة
-backend/                           Mobile API (حزمة wezcrypt_mobile) — إضافة لا تمس الاستوديو الحالي
-  wezcrypt_mobile/migrations/      ترحيلات قاعدة البيانات
-  deploy/                          systemd · nginx · install.sh
-  tests/                           اختبارات pytest
-docs/                              API.md · BACKEND_INTEGRATION.md · SIGNING_AND_INSTALL.md
-.github/workflows/                 بناء iOS على macOS، اختبارات الـ backend
+ios/                                   تطبيق iPhone (SwiftUI)
+  WezCryptSecureStudio/App             نقطة الدخول، AppModel، التنقل
+  WezCryptSecureStudio/Core/Crypto     WZCE، VaultKeys، RecoveryKit، KeyVault (Secure Enclave)
+  WezCryptSecureStudio/Core/Sync       SyncEngine، QueueStore (SQLite)، TransferPolicy، Background URLSession
+  WezCryptSecureStudio/Core/Photos     فحص المكتبة وتصدير الموارد الأصلية
+  WezCryptSecureStudio/Core/Server     BackupAPI، اختبار الاتصال، إعدادات السيرفر (Keychain)
+  WezCryptSecureStudio/Core/Restore    التنزيل وفك التشفير والتحقق والاستعادة
+  WezCryptSecureStudio/Features        Onboarding · Dashboard · Library · Transfers · Settings
+  WezCryptSecureStudioTests            اختبارات وحدة + تكامل مع سيرفر حقيقي
+  WezCryptSecureStudioUITests          اختبارات واجهة
+backend/                               خدمة النسخ المشفّر (حزمة wezcrypt_backup)
+  deploy/                              install.sh · rollback.sh · systemd · nginx · أداة الإدارة
+  tools/                               wzce.py + wezcrypt_restore.py (استعادة من أي كمبيوتر)
+  tests/                               اختبارات pytest
+docs/                                  ARCHITECTURE · INSTALLATION · DEPLOYMENT · RECOVERY · STATUS
+.github/workflows/                     iOS (اختبارات + IPA + Release) · Backend (pytest)
 ```
 
-## المزايا
+## الشاشات
 
-**المكتبة (Library):** All Photos · Recent · Days · Months · Years، مع مصدرين: *الخزنة* (السيرفر) و*هذا الـ iPhone* (PhotoKit مع علامة ✓ للعناصر المرفوعة). تحميل كسول بالصفحات (cursor) — يتحمّل مكتبات 100,000+ عنصر.
+Welcome ← Connect Server ← Test Connection (6 خطوات فعلية) ← Encryption Setup ← Permissions ← **Dashboard**.
+بعدها التبويبات: **Dashboard** (الحالة والمساحة) · **Library** (Photos / Videos / Files + Restore) · **Transfers** (مركز المزامنة: السرعة، الوقت المتبقي، الأخطاء، إعادة المحاولة) · **Settings** (الاتصال، المزامنة، Security، About).
 
-**Sync All:** زر واحد يفحص المكتبة كاملة، يحدد غير المرفوع، ويرفعه تلقائيًا:
-- مسح كامل أول مرة، ثم **مسح تزايدي** عبر `PHPersistentChangeToken`.
-- تصدير **الملف الأصلي** وتنزيله من iCloud Photos عند الحاجة. لا حذف من الجهاز إطلاقًا.
-- SHA-256 لكل ملف ولكل جزء؛ منع التكرار على السيرفر حسب البصمة.
-- رفع **مجزّأ قابل للاستكمال** (8 MiB) — السيرفر هو مرجع الـ offset، فالاستئناف يعمل بعد انقطاع الشبكة أو إغلاق التطبيق.
-- إيقاف مؤقت/استئناف، 1–4 رفعات متوازية، Wi‑Fi فقط أو Wi‑Fi + خلوي، احترام Low Data Mode.
-- عرض السرعة، الوقت المتبقي، العدد/الحجم المتبقي، المساحة الحرة على الجهاز.
-- **Background URLSession** لإكمال الجزء الجاري عند تعليق التطبيق، و**BGProcessingTask/BGAppRefreshTask**.
+كل عنصر في الواجهة مربوط بوظيفة حقيقية، ولا تُعرض أي حالة نجاح لم تؤكدها استجابة فعلية من السيرفر.
 
-> iOS **لا يسمح** بمزامنة مستمرة غير محدودة في الخلفية. النظام يقرر متى تعمل مهام الخلفية (غالبًا أثناء الشحن على Wi‑Fi) ولمدة محدودة. التطبيق يستأنف من حيث توقف كلما سمح النظام، وعند فتحه.
+## البدء السريع
 
-**Transfers:** Pending · Uploading · Completed · Failed مع Retry فردي وجماعي.
+1. **السيرفر**: [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)
+   ```bash
+   sudo bash backend/deploy/install.sh
+   # أضف backend/deploy/nginx-wezcrypt-backup.conf داخل server block الخاص بـ studio.rextv.sbs
+   sudo nginx -t && sudo systemctl reload nginx
+   sudo wezcrypt-backup-admin create-user wez
+   ```
+2. **التطبيق**: [`docs/INSTALLATION.md`](docs/INSTALLATION.md). حمّل `WezCryptSecureStudio-ipa` من GitHub Actions، ثم وقّعه بـ KravaSigner، ثم ثبّته.
+3. **الاستعادة**: [`docs/RECOVERY.md`](docs/RECOVERY.md).
 
-**العارض:** ملء الشاشة، Pinch‑to‑Zoom ونقر مزدوج، سحب بين العناصر، مشغّل فيديو مخصص (تشغيل/إيقاف، ±10 ث، شريط تقدم، المدة)، بث تدريجي عبر `AVAssetResourceLoaderDelegate` بطلبات HTTP Range مصادَق عليها (بدون رموز في الروابط وبدون تحميل الفيديو كاملًا في الذاكرة)، رسالة واضحة للصيغ غير المدعومة. الصور الكاملة تُفك بـ ImageIO بحجم الشاشة ثم يُحذف الملف المؤقت فورًا.
+## العمل في الخلفية — بصراحة
 
-**الألبومات:** إنشاء، إعادة تسمية، حذف، إضافة/إزالة دون حذف الملفات، المفضلة، Videos، Screenshots، Recently Added، حجم كل ألبوم، تحديد متعدد، تفاصيل الملف (الاسم، الحجم، التاريخ، النوع، الأبعاد، المدة).
+iOS **لا يسمح** بمزامنة مستمرة في الخلفية. التطبيق يستخدم الآليات الرسمية فقط:
+- **Background URLSession**: الأجزاء المشفرة الجاهزة تستمر في الرفع بعد تعليق التطبيق.
+- **BGProcessingTask / BGAppRefreshTask**: فرص يحددها النظام (غالبًا أثناء الشحن على Wi‑Fi) لفحص الصور الجديدة وتشفيرها.
+- **مراقبة PhotoKit**: الصور الجديدة تُضاف فورًا أثناء فتح التطبيق.
 
-**البحث:** باسم الملف، حسب التاريخ ونوع الوسائط، وداخل ألبوم.
+**إغلاق التطبيق بالسحب من مبدّل التطبيقات يلغي عمليات الرفع في الخلفية** حتى تفتحه مجددًا. التفاصيل في [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
-**الإعدادات:** Storage · Encryption · Synchronization · Security (Face ID، مهلة القفل، إخفاء المحتوى في مبدّل التطبيقات، الأجهزة المرتبطة وإلغاؤها) · Account · About Developer.
-
-## التشغيل السريع
-
-### 1) السيرفر (Ubuntu 24.04)
-الخدمة الجديدة تعمل **كعملية منفصلة** على `127.0.0.1:8090` ويوجّه nginx المسار `/api/mobile/` فقط إليها. الاستوديو الحالي و`/api/files` و`/api/preview` و`/api/video` لا تُمس.
-
-```bash
-sudo bash backend/deploy/install.sh          # ينشئ المستخدم، venv، المفاتيح، الترحيلات، systemd
-sudo nano /etc/wezcrypt-mobile/mobile.env     # WZC_MOBILE_ALLOWED_TELEGRAM_IDS و WZC_MOBILE_BOT_USERNAME
-sudo bash backend/deploy/install.sh          # إعادة التشغيل بالإعدادات
-# أضف backend/deploy/nginx-mobile.conf داخل server block الخاص بـ studio.rextv.sbs
-sudo nginx -t && sudo systemctl reload nginx
-```
-**احفظ نسخة احتياطية خارجية من `/etc/wezcrypt-mobile/master.keys`** — فقدانه يعني استحالة فك ملفات WZC2.
-
-ثم اربط البوت: أضف أمر `/pair` كما في [`docs/BACKEND_INTEGRATION.md`](docs/BACKEND_INTEGRATION.md).
-
-### 2) التطبيق (من Windows بدون Mac)
-1. ادفع المستودع إلى GitHub — workflow **iOS** يبني ويختبر على macOS تلقائيًا.
-2. من تبويب Actions حمّل artifact:
-   - `WezCryptSecureStudio-unsigned` — **غير موقّع، لا يُثبّت مباشرة** على iPhone.
-   - `WezCryptSecureStudio-signed-*` — يظهر فقط بعد إضافة أسرار التوقيع.
-3. التفاصيل الكاملة للتوقيع والتثبيت: [`docs/SIGNING_AND_INSTALL.md`](docs/SIGNING_AND_INSTALL.md).
-
-### 3) الربط
-افتح التطبيق ← **Generate Pairing Code** ← اضغط **Open Telegram** (أو أرسل `/pair XXXX-XXXX` للبوت) ← يفتح التطبيق تلقائيًا. ثم Transfers ← **Sync All**.
-
-## التطوير
+## التطوير والاختبار
 
 ```bash
-# Backend
 cd backend && pip install -r requirements-dev.txt && python -m pytest -q
-
-# إعادة توليد مشروع Xcode بعد إضافة/حذف ملفات (يعمل على Windows/Linux/macOS)
-gem install xcodeproj
-ruby ios/scripts/generate_xcodeproj.rb
+ruby ios/scripts/generate_xcodeproj.rb     # بعد إضافة/حذف ملفات Swift (gem install xcodeproj)
 ```
+اختبارات iOS تعمل على macOS runner ضد نسخة حقيقية من الـ backend على `127.0.0.1`. ما تم اختباره فعلًا وما لم يُختبر موثّق في [`docs/STATUS.md`](docs/STATUS.md).
 
-عنوان الـ API قابل للتغيير عبر build setting `WZC_API_BASE_URL` (HTTPS فقط).
+## الوثائق
 
-## ما يتطلب حسابك أو أسرارك
-- **Apple Developer Program** لتوقيع IPA قابل للتثبيت (راجع الدليل).
-- أسرار GitHub للتوقيع — لا تُوضع أبدًا داخل المستودع ولا في المحادثة.
-- ربط خطافات WZC1 (`WZC_MOBILE_LEGACY_*`) بدوال الاستوديو الحالي إن أردت عرض الملفات القديمة في التطبيق — الكود الحالي للسيرفر لم يكن متاحًا في هذا المستودع لفحصه، لذا لم يُعدّل ولم يُفترض شكله.
+| الملف | المحتوى |
+|---|---|
+| [`SECURITY.md`](SECURITY.md) | نموذج التهديد، هرم المفاتيح، صيغة WZCE، ما يراه السيرفر |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | المكونات، خط المزامنة، الأداء، حدود الخلفية، API |
+| [`docs/INSTALLATION.md`](docs/INSTALLATION.md) | تحميل IPA والتحقق منه وتوقيعه وتثبيته |
+| [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) | نشر الـ backend وnginx وTLS والتشغيل والتراجع |
+| [`docs/RECOVERY.md`](docs/RECOVERY.md) | مفتاح الاستعادة، جهاز جديد، استعادة من كمبيوتر، كشف التلف |
+| [`docs/STATUS.md`](docs/STATUS.md) | سجل التقدم ونتائج الاختبارات الفعلية والقيود المعروفة |
 
 ## الترخيص
 © wezcrypt. جميع الحقوق محفوظة.

@@ -24,4 +24,4 @@ jobs:
       - run: pip install -r backend/requirements-dev.txt
       - run: python -m pytest -q
         working-directory: backend
-      - run: bash -n backend/deploy/install.sh && bash -n backend/deploy/rollback.sh
+      - run: bash -n backend/deploy/install.sh && bash -n backend/deploy/rollback.sh && bash -n backend/deploy/wezcrypt-backup-admin

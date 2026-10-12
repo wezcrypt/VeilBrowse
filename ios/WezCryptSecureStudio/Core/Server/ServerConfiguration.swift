@@ -28,6 +28,16 @@ struct ServerConfiguration: Codable, Sendable, Equatable {
     var authMethod: AuthMethod
     var username: String
     var collection: String
+    /// Per-request timeout in seconds (nil = default). Optional so configurations
+    /// saved by earlier versions still decode.
+    var timeoutSeconds: Int? = nil
+
+    static let defaultTimeout = 60
+    static let timeoutRange = 10...600
+
+    var requestTimeout: TimeInterval {
+        TimeInterval(min(max(timeoutSeconds ?? Self.defaultTimeout, Self.timeoutRange.lowerBound), Self.timeoutRange.upperBound))
+    }
 
     static let collectionPattern = #"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$"#
     static let usernamePattern = #"^[a-z0-9][a-z0-9_.-]{1,31}$"#
@@ -38,6 +48,7 @@ struct ServerConfiguration: Codable, Sendable, Equatable {
         case invalidUsername
         case invalidCollection
         case missingSecret
+        case invalidTimeout
 
         var errorDescription: String? {
             switch self {
@@ -46,6 +57,7 @@ struct ServerConfiguration: Codable, Sendable, Equatable {
             case .invalidUsername: return String(localized: "Usernames are 2–32 lowercase letters, digits, dot, dash or underscore.")
             case .invalidCollection: return String(localized: "The backup directory may contain letters, digits, dot, dash and underscore (max 64).")
             case .missingSecret: return String(localized: "Enter your password or API key.")
+            case .invalidTimeout: return String(localized: "The connection timeout must be between 10 and 600 seconds.")
             }
         }
     }
@@ -68,6 +80,7 @@ struct ServerConfiguration: Codable, Sendable, Equatable {
             throw ValidationError.invalidCollection
         }
         guard !secret.isEmpty else { throw ValidationError.missingSecret }
+        if let timeoutSeconds, !Self.timeoutRange.contains(timeoutSeconds) { throw ValidationError.invalidTimeout }
     }
 
     private static let defaultsKey = "server.configuration.v2"

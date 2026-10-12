@@ -178,6 +178,20 @@ final class TransferPolicyTests: XCTestCase {
         bad = config
         bad.username = "Bad User"
         XCTAssertThrowsError(try bad.validate(secret: "pw"))
+
+        XCTAssertEqual(try ServerConfiguration.normalizedURL("https://studio.rextv.sbs:8443").port, 8443)
+        XCTAssertEqual(config.requestTimeout, 60)
+        bad = config
+        bad.timeoutSeconds = 5
+        XCTAssertThrowsError(try bad.validate(secret: "pw"))
+        bad.timeoutSeconds = 120
+        XCTAssertNoThrow(try bad.validate(secret: "pw"))
+        XCTAssertEqual(bad.requestTimeout, 120)
+        // Configurations saved before the timeout field existed still decode.
+        let legacy = Data(#"{"serverURL":"https://studio.rextv.sbs","transport":"https","authMethod":"password","username":"alice","collection":"iphone-backups"}"#.utf8)
+        let decoded = try JSONDecoder().decode(ServerConfiguration.self, from: legacy)
+        XCTAssertNil(decoded.timeoutSeconds)
+        XCTAssertEqual(decoded.requestTimeout, 60)
     }
 
     func testBackoff() {

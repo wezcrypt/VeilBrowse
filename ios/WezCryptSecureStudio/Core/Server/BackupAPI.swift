@@ -80,7 +80,7 @@ final class BackupAPI: Sendable {
             self.session = session
         } else {
             let config = URLSessionConfiguration.ephemeral
-            config.timeoutIntervalForRequest = 60
+            config.timeoutIntervalForRequest = configuration.requestTimeout
             config.timeoutIntervalForResource = 3600
             config.httpCookieStorage = nil
             config.httpShouldSetCookies = false
@@ -119,8 +119,8 @@ final class BackupAPI: Sendable {
     }
 
     func request(_ method: String, _ path: String, query: [URLQueryItem] = [], token: String?, body: Data? = nil,
-                 contentType: String? = "application/json", timeout: TimeInterval = 60) throws -> URLRequest {
-        var request = URLRequest(url: try url(path, query: query), timeoutInterval: timeout)
+                 contentType: String? = "application/json", timeout: TimeInterval? = nil) throws -> URLRequest {
+        var request = URLRequest(url: try url(path, query: query), timeoutInterval: timeout ?? configuration.requestTimeout)
         request.httpMethod = method
         request.httpBody = body
         request.setValue("application/json", forHTTPHeaderField: "Accept")

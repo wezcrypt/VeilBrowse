@@ -63,6 +63,7 @@ fi
 run sudo -u wezcrypt-backup env $(grep -v '^#' "$SRC/deploy/backup.env.example" | xargs) \
   "$APP_DIR/venv/bin/python" -m wezcrypt_backup migrate
 
+run install -m 0755 "$SRC/deploy/wezcrypt-backup-admin" /usr/local/sbin/wezcrypt-backup-admin
 run install -m 0644 "$SRC/deploy/wezcrypt-backup.service" /etc/systemd/system/
 run install -m 0644 "$SRC/deploy/wezcrypt-backup-purge.service" /etc/systemd/system/
 run install -m 0644 "$SRC/deploy/wezcrypt-backup-purge.timer" /etc/systemd/system/
@@ -72,5 +73,5 @@ run systemctl restart wezcrypt-backup
 (( DRY_RUN )) || { sleep 1; curl -fsS http://127.0.0.1:8091/api/v2/health; echo; }
 
 log "next: add deploy/nginx-wezcrypt-backup.conf to the studio.rextv.sbs server block, then: nginx -t && systemctl reload nginx"
-log "create your account: sudo -u wezcrypt-backup env \$(cat $CONF_DIR/backup.env | xargs) $APP_DIR/venv/bin/python -m wezcrypt_backup create-user <name>"
+log "create your account: sudo wezcrypt-backup-admin create-user <name>"
 log "rollback: sudo bash $SRC/deploy/rollback.sh"
