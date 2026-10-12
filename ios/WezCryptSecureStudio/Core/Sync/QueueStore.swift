@@ -420,6 +420,14 @@ actor QueueStore {
                 [.double(until.timeIntervalSince1970), .text(objectID), .int(Int64(index))])
     }
 
+    /// Objects owning the given chunk files (used to reconcile transfers iOS finished on its own).
+    func objectIDs(forChunkFiles names: Set<String>) throws -> [String] {
+        guard !names.isEmpty else { return [] }
+        let list = Array(names.prefix(500))
+        let placeholders = list.map { _ in "?" }.joined(separator: ",")
+        return try rows("SELECT DISTINCT object_id FROM chunks WHERE done = 0 AND file_name IN (\(placeholders))", list.map { .text($0) }) { Self.text($0, 0) ?? "" }
+    }
+
     func isChunkDone(objectID: String, index: Int) throws -> Bool {
         try rows("SELECT done FROM chunks WHERE object_id = ? AND idx = ?", [.text(objectID), .int(Int64(index))]) { sqlite3_column_int($0, 0) == 1 }.first ?? true
     }

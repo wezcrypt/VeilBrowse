@@ -63,6 +63,11 @@ struct SyncSnapshot: Sendable, Equatable {
     var deferredByServer = 0
     var waitingRetryAssets = 0
     var waitingRetryChunks = 0
+    /// The app is in the background (uploads already handed to iOS keep running).
+    var inBackground = false
+    /// Chunks handed to iOS for upload while the app is suspended.
+    var backgroundHandoff = 0
+    var lastBackgroundHandoff: Date?
     var lastError: String?
     var isRunning = false
 }
@@ -115,6 +120,11 @@ actor SyncEngine {
     private var meter = ThroughputMeter()
     private var adaptive = AdaptiveConcurrency(ceiling: 4)
     private var deferred = Set<String>()
+    /// Chunk files iOS is still uploading on its own (handed off before suspension).
+    private var systemInFlight: Set<String> = []
+    private var systemInFlightChecked = Date.distantPast
+    /// Files handed to iOS (or found still uploading when a pass starts).
+    private var detachedFiles: Set<String> = []
     /// Items encrypted ahead of the upload: bounded by count as well as bytes, so the
     /// queue on disk (and the work lost if iOS kills the app) stays small.
     var maxPreparedAssets = 24
@@ -200,6 +210,72 @@ actor SyncEngine {
         runTask = nil
         snapshot.isRunning = false
         publish(force: true)
+    }
+
+    // MARK: - Background
+
+    func setBackgroundMode(_ background: Bool) {
+        transport.setDetachOnCancel(background)
+        snapshot.inBackground = background
+        systemInFlightChecked = .distantPast
+        publish(force: true)
+    }
+
+    /// Before iOS suspends the app: hands encrypted chunks that are ready on disk to
+    /// the background URLSession, so iOS keeps uploading them while the app is not
+    /// running. Bounded (count and bytes, and below the server's concurrency limit
+    /// through the session's connection cap). Results are reconciled with the
+    /// server on the next pass; nothing is marked done until the server confirms it.
+    @discardableResult
+    func handOffToBackground(maxChunks: Int = 48, maxBytes: Int64 = 768_000_000) async -> Int {
+        guard let api, transport.supportsBackgroundHandoff, api.pressure.blockedUntil() == nil else { return 0 }
+        transport.setDetachOnCancel(true)
+        let running = await transport.inFlightFileNames()
+        guard let chunks = try? await store.pendingChunks(limit: maxChunks + running.count, excluding: []) else { return 0 }
+        var handed = 0
+        var bytes: Int64 = 0
+        for chunk in chunks where !running.contains(chunk.fileName) {
+            guard handed < maxChunks, bytes + Int64(chunk.size) <= maxBytes else { break }
+            let fileURL = dirs.chunks.appendingPathComponent(chunk.fileName)
+            guard FileManager.default.fileExists(atPath: fileURL.path) else { continue }
+            do {
+                let resolved: String?
+                if let existing = chunk.uploadID { resolved = existing } else { resolved = try await session(for: chunk, api: api) }
+                guard let uploadID = resolved else { continue }
+                let request = try api.chunkRequest(uploadID: uploadID, index: chunk.index, sha256: chunk.sha256, token: try await api.bearerToken())
+                transport.enqueueDetached(request, fromFile: fileURL)
+                detachedFiles.insert(chunk.fileName)
+                handed += 1
+                bytes += Int64(chunk.size)
+            } catch {
+                Log.sync.notice("Background hand-off stopped: \(error.localizedDescription, privacy: .public)")
+                break
+            }
+        }
+        if handed > 0 {
+            snapshot.backgroundHandoff = handed
+            snapshot.lastBackgroundHandoff = Date()
+            Log.sync.info("Handed \(handed, privacy: .public) chunk(s) to iOS for background upload")
+        }
+        publish(force: true)
+        return handed
+    }
+
+    /// iOS finished uploads on its own: ask the server which chunks arrived instead of
+    /// sending them again, and complete objects/items that are now whole.
+    private func reconcile(finishedFiles: Set<String>, api: BackupAPI) async throws {
+        for objectID in try await store.objectIDs(forChunkFiles: finishedFiles) {
+            guard let object = try await store.object(objectID), object.uploadID != nil else { continue }
+            do {
+                try await ensureUpload(object, api: api)
+                if try await store.remainingObjects(localID: object.localID) == 0 {
+                    try await finalize(object.localID, api: api)
+                }
+            } catch let error as APIError where error.isRetryable {
+                Log.sync.notice("Reconciling a background upload failed: \(error.localizedDescription, privacy: .public)")
+            }
+        }
+        await refreshCounts()
     }
 
     func waitForRun() async {
@@ -436,8 +512,20 @@ actor SyncEngine {
                 // what conditions allow and what the server has proven it can take.
                 let capacity = busyUntil == nil ? min(decision.concurrency, adaptive.limit) - inFlight.count : 0
                 snapshot.activeConnections = inFlight.count
+                if capacity > 0, transport.supportsBackgroundHandoff, Date().timeIntervalSince(systemInFlightChecked) > 3 {
+                    let current = await transport.inFlightFileNames()
+                    if systemInFlightChecked == .distantPast && inFlight.isEmpty { detachedFiles.formUnion(current) }
+                    let finished = detachedFiles.subtracting(current)
+                    systemInFlight = current
+                    systemInFlightChecked = Date()
+                    if !finished.isEmpty {
+                        detachedFiles.subtract(finished)
+                        try await reconcile(finishedFiles: finished, api: api)
+                    }
+                }
                 if capacity > 0 {
-                    for chunk in try await store.pendingChunks(limit: capacity, excluding: inFlight) {
+                    for chunk in try await store.pendingChunks(limit: capacity, excluding: inFlight)
+                    where !systemInFlight.contains(chunk.fileName) {
                         inFlight.insert(chunk.key)
                         group.addTask { [self] in
                             do {
@@ -836,11 +924,14 @@ actor SyncEngine {
 
     private func publish(force: Bool = false) {
         let now = Date()
-        if !force, now.timeIntervalSince(lastPublish) < 0.3 {
+        // At most two UI updates per second (one every two seconds in the background)
+        // so the statistics stay smooth without keeping the CPU and display busy.
+        let interval: TimeInterval = snapshot.inBackground ? 2 : 0.5
+        if !force, now.timeIntervalSince(lastPublish) < interval {
             if !publishPending {
                 publishPending = true
                 Task {
-                    try? await Task.sleep(nanoseconds: 300_000_000)
+                    try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
                     await self.flush()
                 }
             }

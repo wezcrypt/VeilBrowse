@@ -43,5 +43,11 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         }
         let handler = UncheckedSendable(completionHandler)
         AppModel.shared.transport.setBackgroundCompletionHandler { handler.value() }
+        Task { @MainActor in
+            let model = AppModel.shared
+            guard model.stage == .ready else { return }
+            await model.engine.configure(api: model.api)
+            model.sync.handleBackgroundSessionWake()
+        }
     }
 }

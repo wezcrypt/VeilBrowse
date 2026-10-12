@@ -43,6 +43,12 @@ enum Formatters {
         ByteCountFormatter.string(fromByteCount: count, countStyle: .file)
     }
 
+    /// Always in gigabytes (two decimals), for totals the user compares over time.
+    static func gigabytes(_ count: Int64) -> String {
+        let value = Double(max(count, 0)) / 1_000_000_000
+        return value.formatted(.number.precision(.fractionLength(value < 10 ? 2 : 1))) + " GB"
+    }
+
     static func speed(_ bytesPerSecond: Double) -> String {
         guard bytesPerSecond.isFinite, bytesPerSecond > 0 else { return "—" }
         return ByteCountFormatter.string(fromByteCount: Int64(bytesPerSecond), countStyle: .file) + "/s"

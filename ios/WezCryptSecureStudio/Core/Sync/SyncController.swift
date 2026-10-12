@@ -116,9 +116,15 @@ final class SyncController {
 
     // MARK: Background
 
+    /// Leaving the app: keep going for the background time iOS grants, then hand
+    /// the encrypted chunks that are ready to the background URLSession so iOS
+    /// continues uploading them while the app is suspended. Uploads in flight are
+    /// detached, never cancelled.
     func appDidEnterBackground() {
         rescheduleBackground()
-        guard snapshot.isRunning, backgroundTaskID == .invalid else { return }
+        let engine = engine
+        Task { await engine.setBackgroundMode(true) }
+        guard settings.backgroundSync, snapshot.isRunning || snapshot.counts.remaining > 0, backgroundTaskID == .invalid else { return }
         backgroundTaskID = UIApplication.shared.beginBackgroundTask(withName: "WezCryptBackup") { @Sendable [weak self] in
             Task { @MainActor in
                 guard let self else { return }
@@ -127,14 +133,52 @@ final class SyncController {
             }
         }
         Task { [weak self, engine] in
+            // Hand off well before the expiration handler (which only gets a moment).
+            try? await Task.sleep(nanoseconds: 20_000_000_000)
+            guard let self, self.backgroundTaskID != .invalid else { return }
+            await engine.handOffToBackground()
+            await engine.stopRun()
+            self.endBackgroundTask()
+        }
+        Task { [weak self, engine] in
             await engine.waitForRun()
-            self?.endBackgroundTask()
+            guard let self, self.backgroundTaskID != .invalid else { return }
+            await engine.handOffToBackground()
+            self.endBackgroundTask()
         }
     }
 
     func appWillEnterForeground() {
         endBackgroundTask()
         updateConditions()
+        let engine = engine
+        Task { await engine.setBackgroundMode(false) }
+    }
+
+    /// iOS relaunched or woke the app because handed-off uploads finished. Use the
+    /// short time granted to reconcile them with the server, encrypt the next items
+    /// and hand off the next batch — this is how a long backup keeps progressing
+    /// while the app stays in the background, within the limits iOS sets.
+    func handleBackgroundSessionWake() {
+        guard settings.backgroundSync, UIApplication.shared.applicationState != .active else { return }
+        let engine = engine
+        let identifier = LockedBox(UIBackgroundTaskIdentifier.invalid)
+        identifier.value = UIApplication.shared.beginBackgroundTask(withName: "WezCryptBackgroundWake") { @Sendable in
+            Task { @MainActor in
+                await engine.stopRun()
+                let id = identifier.value
+                if id != .invalid { UIApplication.shared.endBackgroundTask(id); identifier.value = .invalid }
+            }
+        }
+        Task {
+            await engine.setBackgroundMode(true)
+            await engine.start(fullScan: false)
+            try? await Task.sleep(nanoseconds: 18_000_000_000)
+            await engine.handOffToBackground()
+            await engine.stopRun()
+            let id = identifier.value
+            if id != .invalid { UIApplication.shared.endBackgroundTask(id); identifier.value = .invalid }
+        }
     }
 
     private func endBackgroundTask() {
@@ -163,8 +207,12 @@ final class SyncController {
         let box = UncheckedSendable(task)
         task.expirationHandler = { @Sendable in
             work.cancel()
-            Task { await engine.stopRun() }
+            Task {
+                await engine.handOffToBackground(maxChunks: 16)
+                await engine.stopRun()
+            }
         }
+        Task { await engine.setBackgroundMode(true) }
         Task {
             let success = await work.value
             box.value.setTaskCompleted(success: success)

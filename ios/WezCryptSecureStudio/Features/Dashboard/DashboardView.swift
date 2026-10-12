@@ -14,8 +14,10 @@ struct DashboardView: View {
                 VStack(spacing: 16) {
                     if let warning = model.startupWarning { ErrorBanner(message: warning) }
                     statusCard(sync: sync, snapshot: snapshot)
+                    pressureCard(snapshot)
                     statsGrid(snapshot)
                     conditionsCard(sync)
+                    backgroundCard(snapshot, sync: sync)
                     if !snapshot.active.isEmpty {
                         GlassCard {
                             VStack(alignment: .leading, spacing: 12) {
@@ -91,18 +93,64 @@ struct DashboardView: View {
     }
 
     private func statsGrid(_ snapshot: SyncSnapshot) -> some View {
-        GlassCard {
+        let counts = snapshot.counts
+        return GlassCard {
             Grid(horizontalSpacing: 12, verticalSpacing: 14) {
                 GridRow {
-                    StatTile(title: String(localized: "Backed up"), value: "\(snapshot.counts.completed)", symbol: "checkmark.icloud")
-                    StatTile(title: String(localized: "Remaining"), value: "\(snapshot.counts.remaining)", symbol: "tray.full")
-                    StatTile(title: String(localized: "Failed"), value: "\(snapshot.counts.failed)", symbol: "exclamationmark.triangle")
+                    StatTile(title: String(localized: "Total files"), value: "\(counts.total)", symbol: "square.stack.3d.up")
+                    StatTile(title: String(localized: "Backed up"), value: "\(counts.completed)", symbol: "checkmark.icloud")
+                    StatTile(title: String(localized: "Remaining"), value: "\(counts.remaining)", symbol: "tray.full")
                 }
                 GridRow {
-                    StatTile(title: String(localized: "Speed"), value: Formatters.speed(snapshot.bytesPerSecond), symbol: "speedometer")
-                    StatTile(title: String(localized: "Time left"), value: snapshot.isRunning ? Formatters.eta(snapshot.etaSeconds) : "—", symbol: "clock")
-                    StatTile(title: String(localized: "This session"), value: Formatters.bytes(snapshot.sessionBytes), symbol: "arrow.up")
+                    StatTile(title: String(localized: "Failed"), value: "\(counts.failed)", symbol: "exclamationmark.triangle")
+                    StatTile(title: String(localized: "Uploaded"), value: Formatters.gigabytes(snapshot.uploadedBytes), symbol: "arrow.up.doc")
+                    StatTile(title: String(localized: "Left to upload"), value: Formatters.gigabytes(snapshot.remainingBytes), symbol: "externaldrive")
                 }
+                GridRow {
+                    StatTile(title: String(localized: "Speed now"), value: Formatters.speed(snapshot.bytesPerSecond), symbol: "speedometer")
+                    StatTile(title: String(localized: "Average (2 min)"), value: Formatters.speed(snapshot.averageBytesPerSecond), symbol: "gauge.with.dots.needle.50percent")
+                    StatTile(title: String(localized: "Time left"), value: snapshot.isRunning ? Formatters.eta(snapshot.etaSeconds) : "—", symbol: "clock")
+                }
+                GridRow {
+                    StatTile(title: String(localized: "Connections"),
+                             value: snapshot.isRunning ? "\(snapshot.activeConnections) / \(min(snapshot.adaptiveLimit, max(snapshot.concurrency, 1)))" : "0",
+                             symbol: "point.3.connected.trianglepath.dotted")
+                    StatTile(title: String(localized: "Retry queue"), value: "\(snapshot.waitingRetryAssets + snapshot.waitingRetryChunks)", symbol: "arrow.clockwise")
+                    StatTile(title: String(localized: "Server-deferred"), value: "\(snapshot.deferredByServer)", symbol: "hourglass")
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func pressureCard(_ snapshot: SyncSnapshot) -> some View {
+        if let until = snapshot.serverBusyUntil, until > Date() {
+            GlassCard {
+                VStack(alignment: .leading, spacing: 6) {
+                    Label(String(localized: "Server asked to slow down"), systemImage: "tortoise.fill")
+                        .font(.subheadline.weight(.semibold)).foregroundStyle(Theme.warning)
+                    Text(String(localized: "Uploads resume automatically at \(until.formatted(date: .omitted, time: .standard)). Nothing is lost and no retry attempts are used."))
+                        .font(.caption).foregroundStyle(.secondary)
+                    if let reason = snapshot.serverBusyReason {
+                        Text(reason).font(.caption2).foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+    }
+
+    private func backgroundCard(_ snapshot: SyncSnapshot, sync: SyncController) -> some View {
+        GlassCard {
+            VStack(alignment: .leading, spacing: 6) {
+                Label(sync.settings.backgroundSync ? String(localized: "Background backup on") : String(localized: "Background backup off"),
+                      systemImage: sync.settings.backgroundSync ? "moon.stars.fill" : "moon.zzz")
+                    .font(.subheadline.weight(.semibold))
+                if let last = snapshot.lastBackgroundHandoff {
+                    Text(String(localized: "Last hand-off to iOS: \(snapshot.backgroundHandoff) chunks at \(last.formatted(date: .omitted, time: .shortened))"))
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Text(String(localized: "When you leave the app, prepared encrypted chunks are handed to iOS, which keeps uploading them while the app is suspended. iOS decides when background time is granted. Swiping the app away in the app switcher stops background uploads until you open it again."))
+                    .font(.caption2).foregroundStyle(.secondary)
             }
         }
     }

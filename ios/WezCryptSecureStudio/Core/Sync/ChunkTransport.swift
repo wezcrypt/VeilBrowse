@@ -4,6 +4,24 @@ import Foundation
 /// disk so they work with background URLSessions.
 protocol ChunkTransport: Sendable {
     func upload(_ request: URLRequest, fromFile fileURL: URL) async throws -> (HTTPURLResponse, Data)
+
+    /// True when uploads can outlive the app process (background URLSession).
+    var supportsBackgroundHandoff: Bool { get }
+    /// While set, cancelling the waiting Swift task does NOT cancel the system
+    /// transfer: it keeps running while the app is suspended.
+    func setDetachOnCancel(_ detach: Bool)
+    /// Starts a transfer nobody waits for (handed to iOS before suspension). Its
+    /// result is reconciled with the server on the next pass.
+    func enqueueDetached(_ request: URLRequest, fromFile fileURL: URL)
+    /// Chunk file names of transfers the system is still running.
+    func inFlightFileNames() async -> Set<String>
+}
+
+extension ChunkTransport {
+    var supportsBackgroundHandoff: Bool { false }
+    func setDetachOnCancel(_ detach: Bool) {}
+    func enqueueDetached(_ request: URLRequest, fromFile fileURL: URL) {}
+    func inFlightFileNames() async -> Set<String> { [] }
 }
 
 /// Background URLSession transport: chunks that are in flight keep uploading
@@ -21,6 +39,7 @@ final class BackgroundChunkTransport: NSObject, ChunkTransport, URLSessionDataDe
 
     private let lock = NSLock()
     private var pending: [Int: Pending] = [:]
+    private var detachOnCancel = false
     private var backgroundCompletion: (@MainActor @Sendable () -> Void)?
     private let identifier: String
     private var storedSession: URLSession?
@@ -39,7 +58,9 @@ final class BackgroundChunkTransport: NSObject, ChunkTransport, URLSessionDataDe
         configuration.isDiscretionary = false
         configuration.timeoutIntervalForRequest = 300
         configuration.timeoutIntervalForResource = 7 * 24 * 3600
-        configuration.httpMaximumConnectionsPerHost = 8
+        // Below the server's per-user limit of concurrent chunk requests, also for
+        // transfers iOS runs on its own while the app is suspended.
+        configuration.httpMaximumConnectionsPerHost = 4
         configuration.urlCache = nil
         configuration.httpCookieStorage = nil
         configuration.tlsMinimumSupportedProtocolVersion = .TLSv12
@@ -59,6 +80,25 @@ final class BackgroundChunkTransport: NSObject, ChunkTransport, URLSessionDataDe
         activate()
     }
 
+    var supportsBackgroundHandoff: Bool { true }
+
+    func setDetachOnCancel(_ detach: Bool) {
+        lock.lock()
+        detachOnCancel = detach
+        lock.unlock()
+    }
+
+    func enqueueDetached(_ request: URLRequest, fromFile fileURL: URL) {
+        let task = session.uploadTask(with: request, fromFile: fileURL)
+        task.taskDescription = fileURL.lastPathComponent
+        task.resume()
+    }
+
+    func inFlightFileNames() async -> Set<String> {
+        let tasks = await session.allTasks
+        return Set(tasks.filter { $0.state == .running || $0.state == .suspended }.compactMap(\.taskDescription))
+    }
+
     func upload(_ request: URLRequest, fromFile fileURL: URL) async throws -> (HTTPURLResponse, Data) {
         let task = session.uploadTask(with: request, fromFile: fileURL)
         task.taskDescription = fileURL.lastPathComponent
@@ -71,7 +111,16 @@ final class BackgroundChunkTransport: NSObject, ChunkTransport, URLSessionDataDe
                 task.resume()
             }
         } onCancel: {
-            task.cancel()
+            lock.lock()
+            let detach = detachOnCancel
+            let entry = detach ? pending.removeValue(forKey: taskID) : nil
+            lock.unlock()
+            if detach {
+                // Suspension: release the waiting Swift task but let iOS finish the upload.
+                entry?.continuation.resume(throwing: CancellationError())
+            } else {
+                task.cancel()
+            }
         }
     }
 

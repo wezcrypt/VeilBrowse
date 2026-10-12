@@ -109,6 +109,7 @@ jobs:
             xcrun simctl install "$UDID" "$APP"
             xcrun simctl privacy "$UDID" grant photos "$BUNDLE_ID" || echo "::warning::photos grant failed"
             xcrun simctl privacy "$UDID" grant photos-add "$BUNDLE_ID" || true
+            xcrun simctl privacy "$UDID" grant all "$BUNDLE_ID" || true
             xcodebuild test-without-building -project "$PROJECT" -scheme "$SCHEME" -destination "id=$UDID" \
               -derivedDataPath build/dd -resultBundlePath TestResults.xcresult $SIGN >> xcodebuild-test.log 2>&1
             STATUS=$?

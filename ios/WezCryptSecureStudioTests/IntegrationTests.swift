@@ -239,6 +239,58 @@ final class UploadGovernanceIntegrationTests: IntegrationTestCase {
     }
 }
 
+final class MediaIntegrationTests: IntegrationTestCase {
+    /// A ten-minute H.264 video is backed up, then downloaded through the encrypted
+    /// media cache, decrypted on the device, verified byte-for-byte (SHA-256) and
+    /// played and seeked by the app's player model.
+    @MainActor
+    func testLongVideoDecryptsAndPlaysFromLocalFile() async throws {
+        let api = try makeAPI()
+        let vault = try makeVault()
+        let rig = try await makeRig(api: api, vault: vault, transport: ForegroundChunkTransport())
+        let video = root.appendingPathComponent("long.mov")
+        try await PhotoKitIntegrationTests.writeVideo(to: video, frames: 1200, fps: 2, width: 320, height: 240)
+        let data = try Data(contentsOf: video)
+        let name = "long-video-\(UUID().uuidString).mov"
+        let (original, localID) = try await stageFile(rig, size: data.count, name: name, data: data)
+        await runToCompletion(rig.engine)
+        let state = try await rig.store.asset(localID)?.state
+        XCTAssertEqual(state, .completed)
+
+        let service = RestoreService(api: api, keys: try vault.keys(), workDirectory: try root.appendingPathComponent("restore").createdDirectory())
+        var found: VaultItem?
+        var cursor: String?
+        repeat {
+            let page = try await service.page(cursor: cursor)
+            found = page.items.first { $0.name == name }
+            cursor = page.next
+        } while found == nil && cursor != nil
+        let item = try XCTUnwrap(found)
+        let primary = try XCTUnwrap(item.manifest.primary)
+        let progress = LockedBox(0.0)
+        let decrypted = try await service.viewerFile(primary) { progress.value = $0 }
+        defer { try? FileManager.default.removeItem(at: decrypted.deletingLastPathComponent()) }
+        XCTAssertEqual(try FileHasher.sha256Hex(of: decrypted), try FileHasher.sha256Hex(of: original), "decrypted video must match the original")
+        let cached = await MediaCache.shared.cachedURL(primary.objectId)
+        let cachedURL = try XCTUnwrap(cached)
+        let cachedHead = try FileHandle(forReadingFrom: cachedURL).read(upToCount: 4)
+        XCTAssertEqual(cachedHead, Data("WZCE".utf8), "the cache holds ciphertext only")
+
+        let playback = VideoPlaybackModel()
+        await playback.load(url: decrypted, itemID: item.id)
+        XCTAssertNil(playback.failure)
+        XCTAssertEqual(playback.duration, 600, accuracy: 1)
+        XCTAssertEqual(playback.presentationSize, CGSize(width: 320, height: 240))
+        playback.seek(to: 300)
+        try await Task.sleep(nanoseconds: 500_000_000)
+        XCTAssertEqual(CMTimeGetSeconds(playback.player.currentTime()), 300, accuracy: 2)
+        playback.setRate(2)
+        XCTAssertEqual(playback.rate, 2)
+        playback.teardown()
+        XCTAssertEqual(PlaybackPositions.position(for: item.id) ?? 0, 300, accuracy: 3, "the position is remembered for next time")
+    }
+}
+
 final class IntegrationTests: IntegrationTestCase {
     // MARK: authentication
 
@@ -493,7 +545,7 @@ final class TLSTests: XCTestCase {
 final class PhotoKitIntegrationTests: IntegrationTestCase {
     func testPhotoAndVideoOriginalsBackUpAndRestore() async throws {
         guard PHPhotoLibrary.authorizationStatus(for: .readWrite) == .authorized else {
-            throw XCTSkip("Photos access not granted on this simulator — PhotoKit test NOT EXECUTED")
+            throw XCTSkip("Photos access not granted on this simulator (status \(PHPhotoLibrary.authorizationStatus(for: .readWrite).rawValue)) — PhotoKit test NOT EXECUTED")
         }
         let imageURL = root.appendingPathComponent("test.jpg")
         let image = UIGraphicsImageRenderer(size: CGSize(width: 640, height: 480)).image { context in
@@ -542,24 +594,24 @@ final class PhotoKitIntegrationTests: IntegrationTestCase {
         }
     }
 
-    static func writeVideo(to url: URL) async throws {
+    static func writeVideo(to url: URL, frames: Int = 30, fps: Int32 = 30, width: Int = 64, height: Int = 64) async throws {
         let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
-        let input = AVAssetWriterInput(mediaType: .video, outputSettings: [AVVideoCodecKey: AVVideoCodecType.h264, AVVideoWidthKey: 64, AVVideoHeightKey: 64])
+        let input = AVAssetWriterInput(mediaType: .video, outputSettings: [AVVideoCodecKey: AVVideoCodecType.h264, AVVideoWidthKey: width, AVVideoHeightKey: height])
         let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input, sourcePixelBufferAttributes: [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA, kCVPixelBufferWidthKey as String: 64, kCVPixelBufferHeightKey as String: 64,
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA, kCVPixelBufferWidthKey as String: width, kCVPixelBufferHeightKey as String: height,
         ])
         writer.add(input)
         writer.startWriting()
         writer.startSession(atSourceTime: .zero)
-        for frame in 0..<30 {
+        for frame in 0..<frames {
             while !input.isReadyForMoreMediaData { try await Task.sleep(nanoseconds: 10_000_000) }
             var buffer: CVPixelBuffer?
-            CVPixelBufferCreate(nil, 64, 64, kCVPixelFormatType_32BGRA, nil, &buffer)
+            CVPixelBufferCreate(nil, width, height, kCVPixelFormatType_32BGRA, nil, &buffer)
             guard let buffer else { continue }
             CVPixelBufferLockBaseAddress(buffer, [])
-            memset(CVPixelBufferGetBaseAddress(buffer), Int32(frame * 8), CVPixelBufferGetDataSize(buffer))
+            memset(CVPixelBufferGetBaseAddress(buffer), Int32((frame * 8) % 256), CVPixelBufferGetDataSize(buffer))
             CVPixelBufferUnlockBaseAddress(buffer, [])
-            adaptor.append(buffer, withPresentationTime: CMTime(value: CMTimeValue(frame), timescale: 30))
+            adaptor.append(buffer, withPresentationTime: CMTime(value: CMTimeValue(frame), timescale: fps))
         }
         input.markAsFinished()
         await writer.finishWriting()
