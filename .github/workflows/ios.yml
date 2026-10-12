@@ -155,35 +155,8 @@ jobs:
           tail -3 archive.log
 
       - name: Package and verify IPA
-        run: |
-          set -euo pipefail
-          APP=$(ls -d build/WezCrypt.xcarchive/Products/Applications/*.app)
-          rm -rf dist Payload && mkdir -p dist Payload
-          cp -R "$APP" Payload/
-          rm -rf Payload/*.app/_CodeSignature Payload/*.app/embedded.mobileprovision
-          VERSION=$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" Payload/*.app/Info.plist)
-          IPA="dist/WezCryptSecureStudio-${VERSION}-${{ github.run_number }}-unsigned.ipa"
-          ditto -c -k --sequesterRsrc --keepParent Payload "$IPA"
-          INFO=Payload/WezCryptSecureStudio.app/Info.plist
-          BIN=Payload/WezCryptSecureStudio.app/WezCryptSecureStudio
-          {
-            echo "WezCrypt Secure Studio — build ${{ github.run_number }} (${GITHUB_SHA::7})"
-            echo "CFBundleIdentifier:          $(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' $INFO)"
-            echo "CFBundleShortVersionString:  $VERSION"
-            echo "CFBundleVersion:             $(/usr/libexec/PlistBuddy -c 'Print CFBundleVersion' $INFO)"
-            echo "MinimumOSVersion:            $(/usr/libexec/PlistBuddy -c 'Print MinimumOSVersion' $INFO)"
-            echo "DTPlatformName:              $(/usr/libexec/PlistBuddy -c 'Print DTPlatformName' $INFO)"
-            echo "Architectures:               $(lipo -archs $BIN)"
-            echo "Signed:                      NO — must be signed (e.g. with KravaSigner) before installation"
-            echo "Xcode:                       $(xcodebuild -version | tr '\n' ' ')"
-          } | tee dist/BUILD-INFO.txt
-          test "$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' $INFO)" = "$BUNDLE_ID"
-          test "$(/usr/libexec/PlistBuddy -c 'Print MinimumOSVersion' $INFO)" = "17.0"
-          test "$(/usr/libexec/PlistBuddy -c 'Print DTPlatformName' $INFO)" = "iphoneos"
-          test "$(lipo -archs $BIN)" = "arm64"
-          unzip -l "$IPA" | grep -q "Payload/WezCryptSecureStudio.app/WezCryptSecureStudio"
-          if codesign -v Payload/WezCryptSecureStudio.app 2>/dev/null; then echo "unexpected signature"; exit 1; fi
-          (cd dist && shasum -a 256 *.ipa BUILD-INFO.txt > SHA256SUMS.txt && cat SHA256SUMS.txt)
+        id: package
+        run: bash ios/scripts/package_ipa.sh build/WezCrypt.xcarchive dist "${{ github.run_number }}" "$BUNDLE_ID"
 
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
@@ -194,7 +167,9 @@ jobs:
 
   release:
     name: Publish GitHub Release
-    needs: [test, ipa]
+    # The IPA's structure is verified by the ipa job; the release does not wait
+    # for the simulator test job, whose result is linked in the release notes.
+    needs: [ipa]
     if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish)
     runs-on: ubuntu-24.04
     permissions:
@@ -205,6 +180,15 @@ jobs:
         with:
           name: WezCryptSecureStudio-ipa
           path: dist
+      - name: Re-verify downloaded IPA
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum -c SHA256SUMS.txt
+          IPA=$(ls *.ipa)
+          unzip -tq "$IPA"
+          unzip -Z1 "$IPA" | grep -Fxq "Payload/WezCryptSecureStudio.app/WezCryptSecureStudio"
+          if unzip -Z1 "$IPA" | grep -Eq '(^__MACOSX/|/\._)'; then echo "macOS metadata in IPA"; exit 1; fi
       - name: Source archive
         run: git archive --format=zip -o dist/WezCryptSecureStudio-source.zip HEAD && (cd dist && sha256sum WezCryptSecureStudio-source.zip >> SHA256SUMS.txt)
       - name: Create release
@@ -213,5 +197,12 @@ jobs:
         run: |
           TAG="${GITHUB_REF_NAME}"
           if [[ "$GITHUB_REF" != refs/tags/* ]]; then TAG="build-${{ github.run_number }}"; fi
-          NOTES="Unsigned IPA for external signing (KravaSigner or Xcode). It cannot be installed until it is signed. Verify downloads with SHA256SUMS.txt. See README.md for installation and server setup."
+          IPA=$(cd dist && ls *.ipa)
+          NOTES=$(printf '%s\n' \
+            "Unsigned IPA for external signing (KravaSigner, Sideloadly, AltStore or Xcode). It cannot be installed until it is signed." \
+            "" \
+            "Direct download: https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${IPA}" \
+            "Verify with SHA256SUMS.txt. Build details in BUILD-INFO.txt." \
+            "Simulator test results for this commit: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            "Installation guide: docs/INSTALLATION.md")
           gh release create "$TAG" dist/* --target "$GITHUB_SHA" --title "WezCrypt Secure Studio $TAG" --notes "$NOTES" --prerelease
