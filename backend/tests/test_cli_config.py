@@ -48,3 +48,36 @@ def test_insecure_pepper_permissions_refused(monkeypatch, tmp_path):
 def test_missing_pepper(monkeypatch, capsys):
     monkeypatch.delenv("WZC_BACKUP_TOKEN_PEPPER_FILE", raising=False)
     assert main(["migrate"]) == 2
+
+
+def test_stats_and_reclaim_commands(monkeypatch, tmp_path, capsys):
+    import json
+    import time
+
+    env(monkeypatch, tmp_path)
+    monkeypatch.setenv("WZC_BACKUP_ABANDONED_UPLOAD_SECONDS", "60")
+    assert main(["migrate"]) == 0
+    monkeypatch.setattr(sys, "stdin", io.StringIO("a very long password 123\n"))
+    assert main(["create-user", "carol", "--password-stdin"]) == 0
+    from wezcrypt_backup.app_factory import Context
+
+    ctx = Context.build(Settings.from_env())
+    now = int(time.time())
+    with ctx.db.tx() as conn:
+        user_id = conn.execute("SELECT id FROM users WHERE username = 'carol'").fetchone()["id"]
+        for i, age in enumerate([3600, 3600, 10]):
+            conn.execute(
+                """INSERT INTO uploads(id, user_id, object_id, collection, size_bytes, chunk_size, chunk_count, sha256, status,
+                       created_at, updated_at, expires_at) VALUES (?,?,?,?,?,?,?,?, 'active', ?,?,?)""",
+                (f"{i:032x}", user_id, f"{i + 10:032x}", "iphone-backups", 10, 10, 1, "0" * 64, now - age, now - age, now + 86400),
+            )
+    capsys.readouterr()
+    assert main(["stats"]) == 0
+    stats = json.loads(capsys.readouterr().out)
+    carol = next(u for u in stats["users"] if u["username"] == "carol")
+    assert carol["open_sessions"] == 3 and carol["idle_sessions"] == 2
+    assert main(["reclaim-abandoned"]) == 0
+    assert "reclaimed 2" in capsys.readouterr().out
+    assert main(["stats"]) == 0
+    carol = next(u for u in json.loads(capsys.readouterr().out)["users"] if u["username"] == "carol")
+    assert carol["open_sessions"] == 1

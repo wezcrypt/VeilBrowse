@@ -243,7 +243,6 @@ final class MediaIntegrationTests: IntegrationTestCase {
     /// A ten-minute H.264 video is backed up, then downloaded through the encrypted
     /// media cache, decrypted on the device, verified byte-for-byte (SHA-256) and
     /// played and seeked by the app's player model.
-    @MainActor
     func testLongVideoDecryptsAndPlaysFromLocalFile() async throws {
         let api = try makeAPI()
         let vault = try makeVault()
@@ -276,18 +275,37 @@ final class MediaIntegrationTests: IntegrationTestCase {
         let cachedHead = try FileHandle(forReadingFrom: cachedURL).read(upToCount: 4)
         XCTAssertEqual(cachedHead, Data("WZCE".utf8), "the cache holds ciphertext only")
 
+        let check = await Self.exercisePlayer(url: decrypted, itemID: item.id)
+        XCTAssertNil(check.failure)
+        XCTAssertEqual(check.duration, 600, accuracy: 1)
+        XCTAssertEqual(check.size, CGSize(width: 320, height: 240))
+        XCTAssertEqual(check.positionAfterSeek, 300, accuracy: 2)
+        XCTAssertEqual(check.rate, 2)
+        XCTAssertEqual(check.savedPosition ?? 0, 300, accuracy: 3, "the position is remembered for next time")
+    }
+
+    struct PlayerCheck: Sendable {
+        let failure: String?
+        let duration: Double
+        let size: CGSize
+        let positionAfterSeek: Double
+        let rate: Float
+        let savedPosition: Double?
+    }
+
+    /// Drives the app's player model on the main actor and reports what it observed.
+    @MainActor
+    static func exercisePlayer(url: URL, itemID: String) async -> PlayerCheck {
         let playback = VideoPlaybackModel()
-        await playback.load(url: decrypted, itemID: item.id)
-        XCTAssertNil(playback.failure)
-        XCTAssertEqual(playback.duration, 600, accuracy: 1)
-        XCTAssertEqual(playback.presentationSize, CGSize(width: 320, height: 240))
+        await playback.load(url: url, itemID: itemID)
         playback.seek(to: 300)
-        try await Task.sleep(nanoseconds: 500_000_000)
-        XCTAssertEqual(CMTimeGetSeconds(playback.player.currentTime()), 300, accuracy: 2)
+        try? await Task.sleep(nanoseconds: 500_000_000)
+        let position = CMTimeGetSeconds(playback.player.currentTime())
         playback.setRate(2)
-        XCTAssertEqual(playback.rate, 2)
+        let rate = playback.rate
         playback.teardown()
-        XCTAssertEqual(PlaybackPositions.position(for: item.id) ?? 0, 300, accuracy: 3, "the position is remembered for next time")
+        return PlayerCheck(failure: playback.failure, duration: playback.duration, size: playback.presentationSize,
+                           positionAfterSeek: position, rate: rate, savedPosition: PlaybackPositions.position(for: itemID))
     }
 }
 

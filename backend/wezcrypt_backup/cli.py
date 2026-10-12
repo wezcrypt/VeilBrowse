@@ -140,6 +140,19 @@ def cmd_stats(_args) -> int:
     return 0
 
 
+def cmd_reclaim(_args) -> int:
+    """Cancels upload sessions that never received a chunk and have been idle longer
+    than WZC_BACKUP_ABANDONED_UPLOAD_SECONDS. Sessions with data are never touched."""
+    ctx = _context()
+    now = int(time.time())
+    total = 0
+    with ctx.db.tx() as conn:
+        for row in conn.execute("SELECT id FROM users").fetchall():
+            total += len(ctx.service._reclaim_abandoned(conn, row["id"], now))
+    print(f"reclaimed {total} abandoned upload session(s)")
+    return 0
+
+
 def cmd_purge(_args) -> int:
     print(f"expired {_context().service.purge()} stale upload(s)")
     return 0
@@ -203,6 +216,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("users").set_defaults(func=cmd_users)
     sub.add_parser("stats", help="upload-session health per user").set_defaults(func=cmd_stats)
+    sub.add_parser("reclaim-abandoned", help="cancel empty, idle upload sessions").set_defaults(func=cmd_reclaim)
     sub.add_parser("purge", help="expire stale uploads").set_defaults(func=cmd_purge)
 
     p = sub.add_parser("backup-db")

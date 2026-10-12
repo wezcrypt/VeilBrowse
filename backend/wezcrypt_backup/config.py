@@ -87,7 +87,7 @@ class Settings:
     max_chunks_per_object: int = 200_000
     # Open upload sessions per user. The iOS client opens a session only when it
     # starts sending an object, so it needs about as many as its upload concurrency.
-    max_active_uploads_per_user: int = 128
+    max_active_uploads_per_user: int = 256
     # Chunk PUT requests being received at the same time per user (fair share of
     # disk and CPU between users and devices). Excess requests get 429 + Retry-After.
     max_inflight_chunks_per_user: int = 8
@@ -139,7 +139,7 @@ class Settings:
             max_object_size=_env_int("WZC_BACKUP_MAX_OBJECT_SIZE", 64 * GIB, minimum=1),
             max_chunk_size=_env_int("WZC_BACKUP_MAX_CHUNK_SIZE", 32 * MIB, minimum=64 * 1024, maximum=256 * MIB),
             upload_ttl=_env_int("WZC_BACKUP_UPLOAD_TTL", 7 * 24 * 3600, minimum=3600),
-            max_active_uploads_per_user=_env_int("WZC_BACKUP_MAX_ACTIVE_UPLOADS", 128, minimum=4, maximum=10_000),
+            max_active_uploads_per_user=_env_int("WZC_BACKUP_MAX_ACTIVE_UPLOADS", 256, minimum=4, maximum=10_000),
             max_inflight_chunks_per_user=_env_int("WZC_BACKUP_MAX_INFLIGHT_CHUNKS", 8, minimum=1, maximum=256),
             abandoned_upload_seconds=_env_int("WZC_BACKUP_ABANDONED_UPLOAD_SECONDS", 15 * 60, minimum=60),
             min_free_bytes=_env_int("WZC_BACKUP_MIN_FREE_BYTES", 2 * GIB, minimum=0),

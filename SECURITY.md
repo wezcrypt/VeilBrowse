@@ -101,6 +101,7 @@ Sizes and timing can leak coarse information (e.g. "a 2 GB video was uploaded at
 - Accounts are created on the server with the CLI (`create-user`, `create-api-key`). Passwords are hashed with scrypt; session tokens and API keys are random and stored only as `HMAC-SHA256(pepper, token)`.
 - Sessions expire (default 30 days); logout revokes immediately. Login is rate limited (8 attempts / 15 min per user+IP).
 - Request validation with strict Pydantic models (`extra="forbid"`), id formats enforced, collection names restricted to `[A-Za-z0-9_.-]`, no client-supplied paths reach the filesystem (no path traversal).
+- Fair use per user: at most 8 chunk uploads received at once (more get `429` + `Retry-After`), open upload sessions capped and abandoned empty sessions reclaimed. `GET /api/v2/stats` and `wezcrypt-backup-admin stats` expose counts only (no ids, names or content).
 - Upload quotas per user, minimum free disk reserve, max object/chunk sizes, max active uploads, upload session expiry with an hourly purge timer.
 - Atomic finalization (`fsync` + rename) after hash verification.
 - Permanent deletion requires the header `X-WZC-Confirm-Delete: yes`.
@@ -118,6 +119,7 @@ Sizes and timing can leak coarse information (e.g. "a 2 GB video was uploaded at
 
 - Exported originals and chunk files live in the app container with `NSFileProtectionCompleteUntilFirstUserAuthentication`, are excluded from iCloud backup, and are deleted once the server confirms the object. Leftovers are wiped at launch.
 - Restored files are decrypted into a protected temp directory, verified, handed to Photos/Files, then deleted.
+- Viewer: the on-disk media cache (`Caches/EncryptedMedia`, 1 GB LRU) holds **ciphertext only**. Thumbnails are decrypted in memory. Originals opened in the viewer or player are decrypted into `NSFileProtectionComplete` files that are deleted when the page closes, at launch, on sign-out and when the device locks. Playback positions are stored per random item id (no names or content).
 - Logs use `os.Logger`; identifiers and filenames are `privacy: .private`; tokens, passwords and keys are never logged.
 - Nothing is ever deleted from the Photos library.
 
