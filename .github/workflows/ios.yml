@@ -90,11 +90,14 @@ jobs:
           xcrun simctl privacy "$UDID" grant photos "$BUNDLE_ID" || true
           xcrun simctl privacy "$UDID" grant photos-add "$BUNDLE_ID" || true
 
+      # Simulator builds are ad-hoc signed ("Sign to Run Locally"): without a
+      # signature the app has no application-identifier entitlement and every
+      # Keychain call fails with errSecMissingEntitlement (-34018).
       - name: Unit, integration and UI tests
         run: |
           set +e
           xcodebuild test -project "$PROJECT" -scheme "$SCHEME" -destination "id=${{ steps.sim.outputs.udid }}" \
-            -resultBundlePath TestResults.xcresult CODE_SIGNING_ALLOWED=NO > xcodebuild-test.log 2>&1
+            -resultBundlePath TestResults.xcresult CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM= > xcodebuild-test.log 2>&1
           STATUS=$?
           set -e
           echo "::group::Compiler errors"; grep -E "error:" xcodebuild-test.log | sort -u | head -150; echo "::endgroup::"
