@@ -60,15 +60,18 @@ struct ResourceExporter: Sendable {
         }
         guard !selected.isEmpty else { throw ExportError.noOriginal }
 
+        let entries = selected
+        let total = Double(entries.count)
         var exported: [ExportedResource] = []
         do {
-            for (index, entry) in selected.enumerated() {
+            for (index, entry) in entries.enumerated() {
                 try storage.ensure(256 * 1024 * 1024)
                 let (role, resource) = entry
                 let name = resource.originalFilename.isEmpty ? "\(role.rawValue)-\(UUID().uuidString)" : resource.originalFilename
                 let url = directory.appendingPathComponent(UUID().uuidString)
+                let offset = Double(index)
                 try await write(resource, to: url) { value in
-                    progress?((Double(index) + value) / Double(selected.count))
+                    progress?((offset + value) / total)
                 }
                 let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.int64Value ?? 0
                 exported.append(ExportedResource(role: role, fileURL: url, filename: name, uti: resource.uniformTypeIdentifier, size: size))

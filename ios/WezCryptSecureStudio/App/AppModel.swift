@@ -195,7 +195,13 @@ final class AppModel {
 
     func importFiles(_ urls: [URL]) async -> [String] {
         let importer = FileImporter(stagingDirectory: directories.staging, storage: StorageGuard())
-        let result = await Task.detached { (try? importer.importFiles(urls)) ?? ([], [String(localized: "Import failed")]) }.value
+        let result: (imported: [FileImporter.Imported], failures: [String]) = await Task.detached {
+            do {
+                return try importer.importFiles(urls)
+            } catch {
+                return (imported: [], failures: [error.localizedDescription])
+            }
+        }.value
         do {
             try await engine.enqueueFiles(result.imported)
         } catch {
