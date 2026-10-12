@@ -1,90 +1,126 @@
 # Security Model — WezCrypt Secure Studio
 
-This document states what the system protects against and, just as important, what it does **not**.
+This document describes what the system protects, how, and what it does **not** protect.
+It describes the code in this repository; anything not implemented is labelled as such.
 
 ## 1. Summary
 
-| Property | Status |
+| Property | Implementation |
 |---|---|
-| Transport encryption | HTTPS only (TLS ≥ 1.2, system trust store, no ATS exceptions, no custom/untrusted certificates) |
-| Encryption at rest on server (new uploads) | **WZC2**: AES-256-GCM, random 256-bit data key per file, wrapped by a server master key |
-| Encryption at rest on server (existing files) | **WZC1** (existing studio format) — untouched, read via hooks |
-| End-to-end encryption | **No.** The server holds the master key and can decrypt. |
-| Device authentication | Per-device P-256 key in the Secure Enclave; pairing approved through the Telegram bot |
-| App lock | Face ID / Touch ID / passcode (`LAPolicy.deviceOwnerAuthentication`) |
-| Secrets in the app | None: no bot token, no server keys, no passwords |
+| Encryption location | **On the iPhone, before upload** (end-to-end). The server never receives plaintext or keys. |
+| Cipher | AES-256-GCM (CryptoKit on iOS, `cryptography` in the Python tools) |
+| Per-file keys | Fresh random 256-bit data key (DEK) for every object |
+| Key hierarchy | Recovery key → HKDF-SHA256 → file-wrap key, dedup key, fingerprint key |
+| Container format | **WZCE v1**, versioned, segmented, header-bound (§4) |
+| Metadata | Filenames, capture dates, dimensions, durations, plaintext hashes are inside an **encrypted manifest** |
+| Recovery key at rest on the phone | Sealed under a Secure Enclave P-256 key (hardware), Keychain `AfterFirstUnlockThisDeviceOnly` |
+| Server credentials on the phone | Keychain only; never UserDefaults, files or logs |
+| Transport | HTTPS with the system trust store; no ATS exceptions, no certificate overrides |
+| App lock | Face ID / Touch ID / passcode, privacy cover in the app switcher |
+| Third parties | None: no analytics, no crash reporters, no cloud image recognition, no Telegram |
 
 ## 2. Threat model
 
 **Protected against**
-- Network attackers (TLS; tokens are never placed in URLs).
-- Theft of the server disk or backups *without* the keyring file (`/etc/wezcrypt-mobile/master.keys` is separate from data in `/var/lib/wezcrypt-mobile`).
-- Stolen refresh tokens: refresh requires an ECDSA signature from the device's Secure Enclave key.
-- Refresh-token replay: rotation with reuse detection (a reused token after a 60 s grace window revokes the device).
-- Tampering, truncation, reordering of stored objects (GCM tags bind header, segment index and final flag).
-- Casual access to an unlocked phone: app lock + privacy cover in the app switcher.
-- Cross-user access: every query is scoped by the authenticated user id.
+- A compromised server, a malicious operator, theft of server disks or backups: they hold only WZCE ciphertext and encrypted manifests.
+- Network attackers: TLS with system validation (tested against expired, self-signed, untrusted-root and wrong-host certificates).
+- Tampering with stored data: each segment is authenticated with GCM and bound to the object id, sizes, segment index and the final-segment flag. Swapping, reordering, truncating, appending or moving segments between files is detected.
+- Corrupted uploads: per-chunk and whole-object SHA-256 of the ciphertext are verified by the server before finalization; the app re-verifies the plaintext SHA-256 recorded in the manifest after decryption.
+- Casual access to an unlocked phone: app lock and privacy cover.
+- Cross-account access: every query is scoped by the authenticated user id.
 
 **Not protected against**
-- A compromised server or operator with access to the keyring: they can decrypt everything (no E2EE).
-- A fully compromised (jailbroken) device while the vault is unlocked.
-- Telegram account takeover: whoever controls the allowed Telegram account can pair a new device. Restrict `WZC_MOBILE_ALLOWED_TELEGRAM_IDS` and review *Settings → Security → Linked Devices*.
+- A fully compromised (jailbroken or malware-infected) iPhone while the app is unlocked.
+- Loss of the recovery key **and** every device that holds it — the data is then unrecoverable by design. Nobody, including the server operator, can reset it.
+- Traffic analysis (see §6).
+- Someone who has the recovery key: it is the master secret. Keep it offline.
 
-## 3. Authentication
-
-1. App creates a fresh P-256 key (Secure Enclave on hardware, Keychain on simulator) and calls `POST /api/mobile/pair/start` with the public key.
-2. Server returns an 8-character code (≈40 bits, 5-minute TTL, single use; stored only as an HMAC) plus a pairing id and a poll secret.
-3. The owner sends `/pair CODE` (or taps the `t.me/<bot>?start=pair_CODE` link). The **bot**, which receives a Telegram-authenticated user id, approves the code over loopback (`/api/mobile/internal/pair/approve`, shared secret + loopback-only + blocked in nginx) or in-process.
-4. The app polls and receives its first tokens exactly once.
-
-Tokens: opaque random strings, stored server-side only as HMAC-SHA256(pepper, token). Access tokens live 15 minutes, refresh tokens 30 days. Signing out or revoking a device invalidates all its tokens and cancels its uploads. Telegram `initData` is never used by the native app.
-
-Rate limits (in-process): pair start 10/10 min per IP, poll 120/10 min per pairing, approve 10/h per Telegram user, refresh 30/10 min per device.
-
-## 4. Storage format (WZC2)
+## 3. Key hierarchy
 
 ```
-header (89 B): "WZC2" | ver | segment_size | key_id | wrap_nonce(12) | wrapped_dek(48) | nonce_prefix(8) | plaintext_size
-segment i:     AES-256-GCM(dek, data_i, nonce = prefix‖u32(i), aad = header‖u32(i)‖u8(final))
+Recovery key (256-bit random, shown once as 55 Crockford-Base32 chars + 16-bit checksum)
+ ├─ HKDF-SHA256(salt "WezCrypt-Vault-v1", info "wzce/file-wrap")   → file-wrap key
+ │    └─ AES-GCM wraps each object's random DEK (stored in the WZCE header)
+ ├─ HKDF-SHA256(..., info "wzce/dedup")                              → dedup key
+ │    └─ HMAC-SHA256 content tag (server-side duplicate detection without plaintext hashes)
+ └─ HKDF-SHA256(..., info "wzce/fingerprint")                        → fingerprint key
+      └─ HMAC over a constant → public vault fingerprint (stops a second device from
+         writing into the same account with a different key; reveals nothing about the key)
 ```
-- Chunks are encrypted **as they arrive**; plaintext of WZC2 uploads is never written to disk.
-- Whole-file SHA-256 is verified at completion by streaming decryption; mismatches are discarded.
-- Range requests decrypt only the touched 1 MiB segments (video seeking without full decryption).
-- Key rotation: add a new `id:key` line, set `WZC_MOBILE_ACTIVE_KEY_ID`; old objects stay readable by key id.
-- Swift and Python implementations are verified byte-for-byte by a shared test vector.
 
-**WZC1 compatibility.** The existing studio code was not available in this repository, so WZC1 was **not** re-implemented, modified or assumed. Existing files are read through `WZC_MOBILE_LEGACY_OPEN_HOOK` (calls the studio's own decrypt), decrypted into a 0600 short-TTL cache for range serving, then purged. With `WZC_MOBILE_STORAGE_FORMAT=legacy`, new uploads are handed to the studio's own encrypt function instead. Deleting a legacy entry from the app removes only the index row, never the WZC1 object.
+- Randomness: `SymmetricKey(size:)` / `SecRandomCopyBytes` on iOS, `secrets` / `os.urandom` in Python.
+- The recovery key is never sent to the server. Only the fingerprint is.
+- **On the iPhone** the recovery key is AES-GCM sealed under a key derived (ECDH + HKDF) from a P-256 key that lives in the **Secure Enclave** and cannot be exported. The Keychain stores only the sealed blob and the enclave key's device-bound handle, with `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` (never in iCloud Keychain, never restored to another device, available to background uploads after the first unlock). Simulators lack a Secure Enclave and fall back to the Keychain.
+- Swift and Python derive identical keys; this is checked by a shared test vector (`testKeyDerivationMatchesPython`, `test_wzce.py`).
 
-## 5. On the device
+## 4. WZCE v1 container
 
-- Session tokens and the device key handle: Keychain, `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` (not synced, not restorable to another device; available to background uploads after first unlock).
-- Thumbnail cache: WZC2-encrypted with a random Keychain key. Sign-out destroys the key, making the cache unreadable, and deletes it.
-- Full-resolution photos: downloaded to a `NSFileProtectionComplete` temp file, decoded, deleted immediately. Videos stream from memory only.
-- Exported originals for upload: temp files deleted after each upload; leftovers wiped at launch.
-- Logging: `os.Logger`; tokens, keys, signatures, codes and poll secrets are never logged; identifiers use `privacy: .private`.
+```
+header (104 bytes)
+  "WZCE" | version=1 | alg=1 (AES-256-GCM) | flags u16
+  | segment_size u32 | plaintext_size u64 | object_id (16) | nonce_prefix (8)
+  | key_nonce (12) | wrapped_dek (32 + 16 tag)
+
+segment i (i = 0 … n-1)
+  AES-256-GCM(DEK, plaintext_i,
+              nonce = nonce_prefix ‖ u32_be(i),
+              aad   = header(104) ‖ u32_be(i) ‖ u8(is_final))
+```
+
+- `wrapped_dek = AES-GCM(file-wrap key, DEK, nonce = key_nonce, aad = header_prefix)` where `header_prefix` is the first 44 header bytes, so the wrapped key is bound to the object id and sizes.
+- Nonces: the DEK is unique per object and the 64-bit prefix is random, so `(key, nonce)` pairs never repeat; within an object the counter is the segment index.
+- Default segment size 4 MiB. Encryption and decryption stream segment by segment — memory stays bounded regardless of file size (`testEncryptionMemoryStaysBounded`).
+- Decryption fails closed with a specific error: malformed header, unsupported version, wrong object, key unwrap failure (wrong recovery key), segment authentication failure (index reported), truncation, trailing data.
+- Manifests use the same container with `object_id = item id`.
+- The format is versioned: a future v2 can be added without breaking v1 reads.
+
+## 5. Upload pipeline and integrity
+
+1. Export the original resource from PhotoKit (no re-encoding) to a protected temp file.
+2. Stream it through SHA-256 (plaintext hash → goes into the encrypted manifest) and WZCE encryption into chunk files on disk.
+3. SHA-256 of each ciphertext chunk and of the whole ciphertext object are sent with the upload session.
+4. The server verifies each chunk hash on receipt and the object hash on completion, then atomically renames it into place. A mismatch discards the upload.
+5. After restore, the app and the desktop tool recompute the plaintext SHA-256 and compare it with the manifest before writing the final file.
+
+## 6. What the server can see
+
+The server sees **operational data only**:
+
+| Visible | Not visible |
+|---|---|
+| Username, login IP, session/API-key metadata | Recovery key, any derived key, any DEK |
+| Number of items, item kind (`photo`/`video`/`livePhoto`/`file`) | File contents |
+| Ciphertext sizes (≈ plaintext size + 48 B header overhead + 16 B per 4 MiB) | Filenames, capture dates, locations, dimensions, durations |
+| Upload times (server clock), collection name (default `iphone-backups`) | Plaintext SHA-256 (only a keyed HMAC tag) |
+| Random object/item ids, ciphertext SHA-256 | Thumbnails (encrypted like originals) |
+
+Sizes and timing can leak coarse information (e.g. "a 2 GB video was uploaded at 21:00"). Padding is not implemented because it would cost storage and bandwidth on every file.
+
+## 7. Authentication and server hardening
+
+- Accounts are created on the server with the CLI (`create-user`, `create-api-key`). Passwords are hashed with scrypt; session tokens and API keys are random and stored only as `HMAC-SHA256(pepper, token)`.
+- Sessions expire (default 30 days); logout revokes immediately. Login is rate limited (8 attempts / 15 min per user+IP).
+- Request validation with strict Pydantic models (`extra="forbid"`), id formats enforced, collection names restricted to `[A-Za-z0-9_.-]`, no client-supplied paths reach the filesystem (no path traversal).
+- Upload quotas per user, minimum free disk reserve, max object/chunk sizes, max active uploads, upload session expiry with an hourly purge timer.
+- Atomic finalization (`fsync` + rename) after hash verification.
+- Permanent deletion requires the header `X-WZC-Confirm-Delete: yes`.
+- Audit log (`audit` table) of logins, failed logins, account changes, stored objects and deletions — random ids and sizes only, never tokens, passwords or plaintext data.
+- systemd sandbox: dedicated user, `ProtectSystem=strict`, `NoNewPrivileges`, `UMask=0077`, no capabilities. The pepper file must be mode 600 or the service refuses to start.
+- The API is served only on `127.0.0.1:8091`; nginx terminates TLS.
+
+## 8. Key rotation
+
+- **Data keys**: every object already has its own DEK.
+- **Recovery key rotation** (design, not yet exposed in the UI): generate a new recovery key → for each object, unwrap the DEK with the old file-wrap key and re-wrap with the new one, rewriting only the 104-byte header (no re-encryption of the payload) → re-seal every manifest → `PUT /api/v2/vault` with the new fingerprint after all objects are migrated. Because the server only accepts a fingerprint change for an empty vault today, rotation requires a server endpoint for header replacement. This is documented, not implemented.
+- **Server pepper rotation**: replacing the pepper file invalidates all sessions and API keys (users log in again). Stored data is unaffected.
+
+## 9. On the device
+
+- Exported originals and chunk files live in the app container with `NSFileProtectionCompleteUntilFirstUserAuthentication`, are excluded from iCloud backup, and are deleted once the server confirms the object. Leftovers are wiped at launch.
+- Restored files are decrypted into a protected temp directory, verified, handed to Photos/Files, then deleted.
+- Logs use `os.Logger`; identifiers and filenames are `privacy: .private`; tokens, passwords and keys are never logged.
 - Nothing is ever deleted from the Photos library.
 
-## 6. Server hardening
-
-- Separate systemd service, dedicated user, `UMask=0077`, `ProtectSystem=strict`, `NoNewPrivileges`, empty capability set.
-- Key/secret files must be mode 600 or the service refuses to start.
-- Limits: JSON bodies 1 MiB, chunks 8 MiB, thumbnails 2 MiB, files 20 GiB (configurable), 64 concurrent uploads per device, expired upload parts purged hourly.
-- Strict request validation (`extra="forbid"`), sanitized filenames, parameterized SQL only, explicit `X-WZC-Confirm-Delete: yes` for permanent deletion.
-- Install script backs up the database before migrations; migrations are additive and isolated in their own database.
-
-## 7. Planned: client-side (end-to-end) encryption
-
-Building blocks already exist in `ios/.../Core/Crypto` (`WZC2` with `clientKeyID = 0xFFFFFFFF`, `RecoveryKit`, unit-tested):
-
-1. On opt-in, the app generates a 256-bit **vault key** (Keychain, this-device-only) and a 256-bit **recovery key** displayed once as 55 Crockford-Base32 characters with a checksum; the user must confirm it was saved.
-2. Each file is WZC2-encrypted on the phone with a random data key wrapped by the vault key; the server stores opaque blobs (no server thumbnails — thumbnails are encrypted the same way).
-3. The vault key, wrapped with `HKDF(recovery key)`, is uploaded as an escrow blob the server cannot open.
-4. New devices obtain the vault key from an existing device (ECDH between Secure Enclave keys, approved in-app) or from the recovery key.
-5. Losing all devices **and** the recovery key means data loss — by design, explained before enabling.
-6. Existing server-encrypted files can be re-encrypted client-side in the background; WZC1/WZC2 server objects are deleted only after the client copy is verified.
-
-Until this ships, the app and documentation describe the system as server-side encrypted only.
-
-## 8. Reporting
+## 10. Reporting
 
 Report vulnerabilities privately via https://wezcrypt.com. Do not open public issues for security problems.

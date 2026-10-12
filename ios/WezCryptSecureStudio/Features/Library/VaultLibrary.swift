@@ -16,6 +16,8 @@ final class VaultLibraryModel {
     private var thumbnailTasks: [String: Task<UIImage?, Never>] = [:]
 
     var media: [VaultItem] { items.filter { $0.kind != .file } }
+    var photos: [VaultItem] { items.filter { $0.kind == .photo || $0.kind == .livePhoto } }
+    var videos: [VaultItem] { items.filter { $0.kind == .video } }
     var files: [VaultItem] { items.filter { $0.kind == .file } }
 
     func reload(_ model: AppModel) async {
@@ -68,14 +70,20 @@ final class VaultLibraryModel {
 
 struct LibraryView: View {
     enum Section: String, CaseIterable, Identifiable {
-        case media, files
+        case photos, videos, files
         var id: String { rawValue }
-        var title: String { self == .media ? String(localized: "Photos & Videos") : String(localized: "Files") }
+        var title: String {
+            switch self {
+            case .photos: return String(localized: "Photos")
+            case .videos: return String(localized: "Videos")
+            case .files: return String(localized: "Files")
+            }
+        }
     }
 
     @Environment(AppModel.self) private var model
     @State private var library = VaultLibraryModel()
-    @State private var section: Section = .media
+    @State private var section: Section = .photos
     @State private var showRestore = false
 
     private let columns = [GridItem(.adaptive(minimum: 96), spacing: 2)]
@@ -83,7 +91,7 @@ struct LibraryView: View {
     var body: some View {
         NavigationStack {
             Group {
-                if section == .media { mediaGrid } else { fileList }
+                if section == .files { fileList } else { mediaGrid(section == .photos ? library.photos : library.videos) }
             }
             .overlay {
                 if !library.isLoading && library.items.isEmpty && library.error == nil {
@@ -121,18 +129,41 @@ struct LibraryView: View {
             .sheet(isPresented: $showRestore) { RestoreView(library: library) }
             .refreshable { await library.reload(model) }
             .task { if library.items.isEmpty { await library.reload(model) } }
+            .task(id: section) { await fillSection() }
         }
     }
 
-    private var mediaGrid: some View {
+    private func visibleItems(_ section: Section) -> [VaultItem] {
+        switch section {
+        case .photos: return library.photos
+        case .videos: return library.videos
+        case .files: return library.files
+        }
+    }
+
+    /// The catalog is paged across all kinds, so a section can be empty on the
+    /// first pages. Keep paging (bounded) until it shows something or ends.
+    private func fillSection() async {
+        var pages = 0
+        while visibleItems(section).isEmpty, !library.reachedEnd, library.error == nil, pages < 20, !Task.isCancelled {
+            if library.isLoading {
+                try? await Task.sleep(for: .milliseconds(200))
+                continue
+            }
+            await library.loadMore(model)
+            pages += 1
+        }
+    }
+
+    private func mediaGrid(_ visible: [VaultItem]) -> some View {
         ScrollView {
             LazyVGrid(columns: columns, spacing: 2) {
-                ForEach(library.media) { item in
+                ForEach(visible) { item in
                     NavigationLink(value: item.id) {
                         VaultThumbnail(item: item, library: library)
                     }
                     .buttonStyle(.plain)
-                    .task { if item.id == library.media.last?.id { await library.loadMore(model) } }
+                    .task { if item.id == visible.last?.id { await library.loadMore(model) } }
                 }
             }
             if library.isLoading { ProgressView().padding() }

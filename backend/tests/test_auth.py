@@ -87,3 +87,16 @@ def test_vault_fingerprint_is_write_once(client, auth, keys):
     assert other.status_code == 409
     assert other.json()["error"]["code"] == "vault_mismatch"
     assert client.get("/api/v2/vault", headers=auth).json()["fingerprint"] == keys.fingerprint
+
+
+def test_health_and_capabilities_are_public(client):
+    health = client.get("/api/v2/health")
+    assert health.status_code == 200
+    assert health.json()["status"] == "ok"
+    caps = client.get("/api/v2/capabilities")
+    assert caps.status_code == 200
+    body = caps.json()
+    assert body["encryption"] == "client-side only"
+    assert body["resumable_uploads"] is True
+    assert body["max_chunk_bytes"] >= 64 * 1024
+    assert "https" in body["transports"]

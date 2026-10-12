@@ -70,11 +70,23 @@ jobs:
 
       - name: Boot simulator and grant Photos access
         id: sim
+        timeout-minutes: 25
         run: |
           UDID=$(python3 ios/scripts/pick_simulator.py --verbose)
           echo "udid=$UDID" >> "$GITHUB_OUTPUT"
-          xcrun simctl boot "$UDID" || true
-          xcrun simctl bootstatus "$UDID" -b
+          # Hosted runners occasionally hang in bootstatus. Bound each attempt
+          # (perl alarm: macOS has no coreutils timeout) and retry once from a
+          # clean device before giving up.
+          boot() {
+            xcrun simctl boot "$UDID" 2>/dev/null || true
+            perl -e 'alarm shift; exec @ARGV' 420 xcrun simctl bootstatus "$UDID" -b
+          }
+          if ! boot; then
+            echo "::warning::Simulator boot timed out; erasing and retrying"
+            xcrun simctl shutdown "$UDID" || true
+            xcrun simctl erase "$UDID"
+            boot
+          fi
           xcrun simctl privacy "$UDID" grant photos "$BUNDLE_ID" || true
           xcrun simctl privacy "$UDID" grant photos-add "$BUNDLE_ID" || true
 

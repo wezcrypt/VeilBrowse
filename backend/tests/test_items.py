@@ -121,3 +121,20 @@ def test_desktop_restore_tool_end_to_end(app, tmp_path):
     finally:
         server.should_exit = True
         thread.join(timeout=5)
+
+
+def test_storage_events_are_audited_without_secrets(client, auth, keys, settings):
+    import sqlite3
+
+    from conftest import encrypt_object, upload_object
+
+    obj = encrypt_object(keys, b"\x00" * 1000)
+    upload_object(client, auth, obj)
+    assert client.delete(f"/api/v2/objects/{obj.object_id}", headers=auth).status_code == 204
+    conn = sqlite3.connect(settings.db_path)
+    rows = conn.execute("SELECT event, detail FROM audit WHERE event LIKE 'object.%' ORDER BY id").fetchall()
+    conn.close()
+    assert rows[0] == ("object.stored", f"{obj.object_id} {len(obj.ciphertext)}")
+    assert rows[1] == ("object.deleted", obj.object_id)
+    for _, detail in rows:
+        assert "wzt_" not in detail

@@ -140,6 +140,23 @@ def create_router(settings: Settings, auth: AuthService, service: BackupService)
     async def health() -> dict:
         return {"status": "ok", "api_version": 2, "encryption": "client-side only"}
 
+    @router.get("/capabilities")
+    async def capabilities() -> dict:
+        return {
+            "api_version": 2,
+            "encryption": "client-side only",
+            "container_formats": ["WZCE/1"],
+            "auth": ["password", "api_key"],
+            "resumable_uploads": True,
+            "max_chunk_bytes": settings.max_chunk_size,
+            "max_object_bytes": settings.max_object_size,
+            "max_chunks_per_object": settings.max_chunks_per_object,
+            "upload_ttl_seconds": settings.upload_ttl,
+            "range_downloads": True,
+            "integrity": "sha256-per-chunk-and-object",
+            "transports": ["https"],
+        }
+
     # ------------------------------------------------------------------ auth
 
     @router.post("/auth/login")

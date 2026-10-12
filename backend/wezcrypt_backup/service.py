@@ -65,6 +65,13 @@ class BackupService:
     def _now(self) -> int:
         return int(self.clock())
 
+    def _audit(self, conn, event: str, user_id: int, detail: str | None = None) -> None:
+        """Audit trail of storage events. Records random ids and sizes only, never secrets or plaintext."""
+        conn.execute(
+            "INSERT INTO audit(user_id, event, detail, client_ip, created_at) VALUES (?,?,?,?,?)",
+            (user_id, event, detail, None, self._now()),
+        )
+
     def _lock(self, key: str) -> threading.Lock:
         with self._guard:
             return self._locks.setdefault(key, threading.Lock())
@@ -317,6 +324,7 @@ class BackupService:
                 )
                 conn.execute("UPDATE uploads SET status = 'completed', updated_at = ? WHERE id = ?", (now, upload_id))
                 conn.execute("DELETE FROM upload_chunks WHERE upload_id = ?", (upload_id,))
+                self._audit(conn, "object.stored", principal.user_id, f"{row['object_id']} {total}")
             shutil.rmtree(self.upload_dir(upload_id), ignore_errors=True)
             return {"status": "completed", "object_id": row["object_id"], "size_bytes": total, "sha256": row["sha256"]}
         finally:
@@ -386,6 +394,7 @@ class BackupService:
             if conn.execute("SELECT 1 FROM item_objects WHERE user_id = ? AND object_id = ?", (principal.user_id, object_id)).fetchone():
                 raise conflict("object_in_use", "Object belongs to an item; delete the item instead")
             conn.execute("DELETE FROM objects WHERE user_id = ? AND id = ?", (principal.user_id, object_id))
+            self._audit(conn, "object.deleted", principal.user_id, object_id)
         self.object_path(principal.username, row["collection"], object_id).unlink(missing_ok=True)
 
     # --------------------------------------------------------------- items
@@ -526,6 +535,7 @@ class BackupService:
                 if obj is not None:
                     conn.execute("DELETE FROM objects WHERE user_id = ? AND id = ?", (principal.user_id, object_id))
                     removed.append((obj["collection"], object_id))
+            self._audit(conn, "item.deleted", principal.user_id, f"{item_id} objects={len(removed)}")
         for collection, object_id in removed:
             self.object_path(principal.username, collection, object_id).unlink(missing_ok=True)
         return len(removed)
