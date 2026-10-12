@@ -96,6 +96,54 @@ final class QueueStoreTests: XCTestCase {
         XCTAssertEqual(counts.active, 0)
     }
 
+    func testLazySessionsDeferralAndOpenSessionTracking() async throws {
+        let store = try QueueStore(path: path)
+        try await store.upsertScanned(scanned(2), generation: try await store.nextGeneration())
+        var withoutSession = object("o0", localID: "asset-0", chunks: 2)
+        withoutSession.0.uploadID = nil
+        try await store.markPreparing("asset-0")
+        try await store.savePrepared(PreparedItem(localID: "asset-0", itemID: "i0", kind: .video, manifest: Data([1]), contentTag: "t0", objectIDs: ["o0"]),
+                                     displayName: nil, totalBytes: 8, objects: [withoutSession])
+        try await store.markPreparing("asset-1")
+        try await store.savePrepared(PreparedItem(localID: "asset-1", itemID: "i1", kind: .photo, manifest: Data([1]), contentTag: "t1", objectIDs: ["o1"]),
+                                     displayName: nil, totalBytes: 8, objects: [object("o1", localID: "asset-1", chunks: 1)])
+        // Chunks without a server session are eligible (the session opens lazily), but
+        // objects that already have one are finished first.
+        let pending = try await store.pendingChunks(limit: 10, excluding: [])
+        XCTAssertEqual(pending.map(\.objectID), ["o1", "o0", "o0"])
+        XCTAssertNil(pending[1].uploadID)
+        let open = try await store.openSessionCount()
+        XCTAssertEqual(open, 1)
+        let ids = try await store.openUploadIDs(localID: "asset-1")
+        XCTAssertEqual(ids, ["u-o1"])
+        // Back-pressure deferral postpones without counting an attempt.
+        try await store.deferChunk(objectID: "o1", index: 0, until: Date().addingTimeInterval(60))
+        let afterDefer = try await store.pendingChunks(limit: 10, excluding: [])
+        XCTAssertEqual(afterDefer.map(\.objectID), ["o0", "o0"])
+        let waiting = try await store.waitingRetryCounts()
+        XCTAssertEqual(waiting.chunks, 1)
+        let deferredAttempts = try await store.markChunkRetry(objectID: "o1", index: 0, retryAfter: Date().addingTimeInterval(60))
+        XCTAssertEqual(deferredAttempts, 1, "the deferral itself did not count as an attempt")
+        let inFlight = try await store.inFlightAssetCount()
+        XCTAssertEqual(inFlight, 2)
+    }
+
+    func testRemainingBytesEstimateUsesMeasuredAverages() async throws {
+        let store = try QueueStore(path: path)
+        try await store.upsertScanned((0..<4).map { ScannedAsset(localID: "p\($0)", kind: .photo, createdAt: Date()) }, generation: try await store.nextGeneration())
+        // Two photos measured (10 MB and 20 MB) and backed up, two not read yet.
+        for (id, size) in [("p0", Int64(10_000_000)), ("p1", Int64(20_000_000))] {
+            try await store.markPreparing(id)
+            try await store.savePrepared(PreparedItem(localID: id, itemID: "i\(id)", kind: .photo, manifest: Data([1]), contentTag: "t\(id)", objectIDs: ["o\(id)"]),
+                                         displayName: nil, totalBytes: size, objects: [object("o\(id)", localID: id, chunks: 1)])
+            _ = try await store.markFinished(id, duplicate: false)
+        }
+        let remaining = try await store.remainingBytesEstimate()
+        XCTAssertEqual(remaining, 30_000_000, "two unread photos × 15 MB average")
+        let uploaded = try await store.completedBytes()
+        XCTAssertEqual(uploaded, 30_000_000)
+    }
+
     func testPruneKeepsBackedUpItems() async throws {
         let store = try QueueStore(path: path)
         let first = try await store.nextGeneration()

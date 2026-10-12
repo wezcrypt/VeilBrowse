@@ -114,6 +114,32 @@ def cmd_users(_args) -> int:
     return 0
 
 
+def cmd_stats(_args) -> int:
+    """Upload-session health per user (counts and sizes only)."""
+    ctx = _context()
+    now = int(time.time())
+    with ctx.db.read() as conn:
+        rows = conn.execute(
+            """SELECT u.username,
+                      (SELECT COUNT(*) FROM uploads s WHERE s.user_id = u.id AND s.status = 'active') AS open_sessions,
+                      (SELECT COUNT(*) FROM uploads s WHERE s.user_id = u.id AND s.status = 'active' AND s.updated_at < ?) AS idle_sessions,
+                      (SELECT COUNT(*) FROM objects o WHERE o.user_id = u.id) AS objects,
+                      (SELECT COALESCE(SUM(size_bytes),0) FROM objects o WHERE o.user_id = u.id) AS stored_bytes,
+                      (SELECT COUNT(*) FROM items i WHERE i.user_id = u.id) AS items
+               FROM users u ORDER BY u.username""",
+            (now - ctx.settings.abandoned_upload_seconds,),
+        ).fetchall()
+    print(json.dumps({
+        "limits": {
+            "max_open_upload_sessions": ctx.settings.max_active_uploads_per_user,
+            "max_concurrent_chunk_requests": ctx.settings.max_inflight_chunks_per_user,
+            "abandoned_upload_seconds": ctx.settings.abandoned_upload_seconds,
+        },
+        "users": [dict(row) for row in rows],
+    }, indent=2))
+    return 0
+
+
 def cmd_purge(_args) -> int:
     print(f"expired {_context().service.purge()} stale upload(s)")
     return 0
@@ -176,6 +202,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_quota)
 
     sub.add_parser("users").set_defaults(func=cmd_users)
+    sub.add_parser("stats", help="upload-session health per user").set_defaults(func=cmd_stats)
     sub.add_parser("purge", help="expire stale uploads").set_defaults(func=cmd_purge)
 
     p = sub.add_parser("backup-db")

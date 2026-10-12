@@ -7,6 +7,40 @@ import time
 from collections import deque
 
 
+class ConcurrencyLimiter:
+    """Counts requests in progress per key. Always pair acquire() with release()
+    (use `slot()`), so a failing request can never leak a slot."""
+
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self._active: dict[str, int] = {}
+        self._lock = threading.Lock()
+
+    def acquire(self, key: str) -> bool:
+        with self._lock:
+            current = self._active.get(key, 0)
+            if current >= self.limit:
+                return False
+            self._active[key] = current + 1
+            return True
+
+    def release(self, key: str) -> None:
+        with self._lock:
+            current = self._active.get(key, 0) - 1
+            if current > 0:
+                self._active[key] = current
+            else:
+                self._active.pop(key, None)
+
+    def active(self, key: str) -> int:
+        with self._lock:
+            return self._active.get(key, 0)
+
+    def total(self) -> int:
+        with self._lock:
+            return sum(self._active.values())
+
+
 class SlidingWindowLimiter:
     def __init__(self, limit: int, window_seconds: int, clock=time.monotonic) -> None:
         self.limit = limit

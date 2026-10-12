@@ -44,6 +44,11 @@ def rate_limited(retry_after: int) -> APIError:
     return APIError(429, "rate_limited", "Too many requests", headers={"Retry-After": str(retry_after)})
 
 
+def server_busy(code: str, message: str, retry_after: int, status: int = 429) -> APIError:
+    """Back-pressure response. Clients must wait Retry-After seconds before trying again."""
+    return APIError(status, code, message, headers={"Retry-After": str(max(1, int(retry_after)))}, extra={"retry_after": max(1, int(retry_after))})
+
+
 async def _handle(_: Request, exc: Exception) -> JSONResponse:
     assert isinstance(exc, APIError)
     body = {"error": {"code": exc.code, "message": exc.message, **exc.extra}}

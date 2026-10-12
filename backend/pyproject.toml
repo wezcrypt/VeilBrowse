@@ -13,7 +13,7 @@ build-backend = "setuptools.build_meta"
 include = ["wezcrypt_backup*"]
 
 [tool.setuptools.package-data]
-wezcrypt_backup = ["migrations/*.sql"]
+wezcrypt_backup = ["migrations/*.sql", "migrations/rollback/*.sql"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

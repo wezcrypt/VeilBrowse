@@ -127,6 +127,117 @@ class IntegrationTestCase: XCTestCase {
 
 }
 
+/// Wraps the real transport: measures how many chunk uploads run at the same time
+/// and can answer the first N requests with 429/503 like a busy server would.
+final class GovernedTransport: ChunkTransport, @unchecked Sendable {
+    private let inner = ForegroundChunkTransport()
+    let rejectFirst: Int
+    let rejectStatus: Int
+    let retryAfter: String?
+    let current = LockedBox(0)
+    let peak = LockedBox(0)
+    let sent = LockedBox(0)
+    let rejected = LockedBox(0)
+
+    init(rejectFirst: Int = 0, rejectStatus: Int = 429, retryAfter: String? = nil) {
+        self.rejectFirst = rejectFirst
+        self.rejectStatus = rejectStatus
+        self.retryAfter = retryAfter
+    }
+
+    func upload(_ request: URLRequest, fromFile fileURL: URL) async throws -> (HTTPURLResponse, Data) {
+        let reject = rejected.withValue { value -> Bool in
+            guard value < rejectFirst else { return false }
+            value += 1
+            return true
+        }
+        if reject {
+            var headers = ["Content-Type": "application/json"]
+            if let retryAfter { headers["Retry-After"] = retryAfter }
+            let body = Data(#"{"error":{"code":"too_many_chunk_requests","message":"Server busy (test)"}}"#.utf8)
+            let response = try XCTUnwrap(HTTPURLResponse(url: try XCTUnwrap(request.url), statusCode: rejectStatus, httpVersion: "HTTP/1.1", headerFields: headers))
+            return (response, body)
+        }
+        let now = current.withValue { value -> Int in value += 1; return value }
+        peak.withValue { $0 = max($0, now) }
+        defer { current.withValue { $0 -= 1 } }
+        let result = try await inner.upload(request, fromFile: fileURL)
+        sent.withValue { $0 += 1 }
+        return result
+    }
+}
+
+final class UploadGovernanceIntegrationTests: IntegrationTestCase {
+    /// 1,000 files through the full engine against the real backend: everything is
+    /// backed up exactly once, the device never exceeds its global limit of parallel
+    /// uploads, and no upload session is left open on the server.
+    func testThousandFilesRespectGlobalLimitAndLeaveNoSessions() async throws {
+        let api = try makeAPI()
+        let vault = try makeVault()
+        let transport = GovernedTransport()
+        let rig = try await makeRig(api: api, vault: vault, transport: transport, chunkMB: 8, concurrency: 4)
+        var originals: [(URL, String)] = []
+        for index in 0..<1000 {
+            let data = WZCE.randomBytes(1024 + index)
+            originals.append(try await stageFile(rig, size: data.count, name: "bulk-\(index)-\(UUID().uuidString).bin", data: data))
+        }
+        let start = Date()
+        await runToCompletion(rig.engine)
+        let seconds = Date().timeIntervalSince(start)
+        let counts = try await rig.store.counts()
+        XCTAssertEqual(counts.completed, 1000)
+        XCTAssertEqual(counts.failed, 0)
+        XCTAssertEqual(counts.remaining, 0)
+        XCTAssertLessThanOrEqual(transport.peak.value, 4, "never more parallel uploads than the global limit")
+        XCTAssertEqual(transport.sent.value, 1000, "every file sent exactly once (one chunk each)")
+        if let stats = try? await api.uploadStats() {
+            XCTAssertEqual(stats.user.openUploadSessions, 0, "no session left open on the server")
+        }
+        print("[benchmark] 1,000 files backed up in \(String(format: "%.1f", seconds)) s, peak parallel uploads \(transport.peak.value)")
+        // Spot-check byte-exact restores.
+        for index in [0, 499, 999] {
+            let (original, localID) = originals[index]
+            let name = try await rig.store.asset(localID)?.displayName ?? ""
+            let restored = try XCTUnwrap(try await restoredData(api: api, vault: vault, name: name))
+            XCTAssertEqual(try FileHasher.sha256Hex(of: original), try FileHasher.sha256Hex(of: restored), "restored bytes must match the original (SHA-256)")
+        }
+        // Running again uploads nothing (completed files are never re-sent).
+        await runToCompletion(rig.engine)
+        XCTAssertEqual(transport.sent.value, 1000)
+    }
+
+    func testHTTP429WithRetryAfterIsHonouredWithoutFailures() async throws {
+        try await assertPressureHandled(status: 429, retryAfter: "2", minimumWait: 2)
+    }
+
+    func testHTTP503WithoutRetryAfterBacksOffWithoutFailures() async throws {
+        try await assertPressureHandled(status: 503, retryAfter: nil, minimumWait: 1)
+    }
+
+    private func assertPressureHandled(status: Int, retryAfter: String?, minimumWait: TimeInterval) async throws {
+        let api = try makeAPI()
+        let vault = try makeVault()
+        let transport = GovernedTransport(rejectFirst: 3, rejectStatus: status, retryAfter: retryAfter)
+        let rig = try await makeRig(api: api, vault: vault, transport: transport, chunkMB: 8, concurrency: 4)
+        var ids: [String] = []
+        for index in 0..<5 {
+            ids.append(try await stageFile(rig, size: 4096, name: "pressure-\(status)-\(index)-\(UUID().uuidString).bin").1)
+        }
+        let start = Date()
+        await runToCompletion(rig.engine)
+        let elapsed = Date().timeIntervalSince(start)
+        XCTAssertEqual(transport.rejected.value, 3)
+        XCTAssertGreaterThanOrEqual(elapsed, minimumWait, "the engine waited for the server instead of retrying immediately")
+        XCTAssertGreaterThanOrEqual(api.pressure.state.events, 3)
+        for id in ids {
+            let asset = try await rig.store.asset(id)
+            XCTAssertEqual(asset?.state, .completed, asset?.lastError ?? "")
+            XCTAssertEqual(asset?.attempts, 0, "server pressure must not use up retry attempts")
+        }
+        XCTAssertEqual(transport.sent.value, 5)
+    }
+}
+
 final class IntegrationTests: IntegrationTestCase {
     // MARK: authentication
 

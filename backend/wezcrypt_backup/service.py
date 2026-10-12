@@ -24,7 +24,8 @@ from pathlib import Path
 from .auth import Principal
 from .config import COLLECTION_RE, Settings
 from .db import Database
-from .errors import APIError, bad_request, conflict, not_found, too_large
+from .errors import APIError, bad_request, conflict, not_found, server_busy, too_large
+from .ratelimit import ConcurrencyLimiter
 
 logger = logging.getLogger("wezcrypt_backup.service")
 
@@ -61,6 +62,21 @@ class BackupService:
         self.root = settings.storage_root.resolve()
         self._locks: dict[str, threading.Lock] = {}
         self._guard = threading.Lock()
+        self.chunk_slots = ConcurrencyLimiter(settings.max_inflight_chunks_per_user)
+        # Process-local counters for monitoring (no ids, keys or content).
+        self.metrics: dict[str, int] = {
+            "chunks_received": 0,
+            "chunk_bytes_received": 0,
+            "chunks_rejected_busy": 0,
+            "sessions_rejected_busy": 0,
+            "sessions_reclaimed": 0,
+            "objects_completed": 0,
+        }
+        self._metrics_lock = threading.Lock()
+
+    def count(self, name: str, amount: int = 1) -> None:
+        with self._metrics_lock:
+            self.metrics[name] = self.metrics.get(name, 0) + amount
 
     def _now(self) -> int:
         return int(self.clock())
@@ -204,7 +220,15 @@ class BackupService:
 
             active = conn.execute("SELECT COUNT(*) FROM uploads WHERE user_id = ? AND status = 'active'", (principal.user_id,)).fetchone()[0]
             if active >= self.settings.max_active_uploads_per_user:
-                raise APIError(429, "too_many_uploads", "Too many concurrent uploads")
+                reclaimed = self._reclaim_abandoned(conn, principal.user_id, now)
+                active -= len(reclaimed)
+                if active >= self.settings.max_active_uploads_per_user:
+                    self.count("sessions_rejected_busy")
+                    raise server_busy(
+                        "too_many_uploads",
+                        f"Too many open uploads ({active}); finish or cancel some before starting new ones",
+                        retry_after=30,
+                    )
             quota = conn.execute("SELECT quota_bytes FROM users WHERE id = ?", (principal.user_id,)).fetchone()["quota_bytes"]
             stored, pending = self.used_bytes(conn, principal.user_id)
             if quota is not None and stored + pending + size_bytes > quota:
@@ -223,6 +247,28 @@ class BackupService:
             self.upload_dir(upload_id).mkdir(mode=0o700, parents=True, exist_ok=False)
             row = conn.execute("SELECT * FROM uploads WHERE id = ?", (upload_id,)).fetchone()
             return {"status": "active", **self._upload_dict(conn, row)}
+
+    def _reclaim_abandoned(self, conn, user_id: int, now: int) -> list[str]:
+        """Cancels this user's sessions that never received a chunk and have been idle
+        longer than `abandoned_upload_seconds` (left behind by a client that gave up).
+        Sessions with received chunks are never touched here, so a slow but live upload
+        keeps its progress."""
+        cutoff = now - self.settings.abandoned_upload_seconds
+        rows = conn.execute(
+            """SELECT id FROM uploads u WHERE u.user_id = ? AND u.status = 'active' AND u.updated_at < ?
+               AND NOT EXISTS (SELECT 1 FROM upload_chunks c WHERE c.upload_id = u.id)
+               ORDER BY u.updated_at LIMIT 1000""",
+            (user_id, cutoff),
+        ).fetchall()
+        ids = [row["id"] for row in rows]
+        for upload_id in ids:
+            conn.execute("UPDATE uploads SET status = 'cancelled', updated_at = ? WHERE id = ?", (now, upload_id))
+            shutil.rmtree(self.upload_dir(upload_id), ignore_errors=True)
+        if ids:
+            self.count("sessions_reclaimed", len(ids))
+            self._audit(conn, "uploads.reclaimed", user_id, str(len(ids)))
+            logger.info("reclaimed %d abandoned upload session(s)", len(ids))
+        return ids
 
     def _active_upload(self, conn, principal: Principal, upload_id: str):
         check_hex32(upload_id, "upload_id")
@@ -278,7 +324,12 @@ class BackupService:
                     "INSERT INTO upload_chunks(upload_id, idx, size_bytes, sha256, received_at) VALUES (?,?,?,?,?)",
                     (upload_id, index, size, sha256, self._now()),
                 )
-                conn.execute("UPDATE uploads SET updated_at = ? WHERE id = ?", (self._now(), upload_id))
+                # Activity keeps the session alive: the purge timer only expires sessions
+                # idle for a full upload_ttl, never one that is still receiving data.
+                now = self._now()
+                conn.execute("UPDATE uploads SET updated_at = ?, expires_at = ? WHERE id = ?", (now, now + self.settings.upload_ttl, upload_id))
+        self.count("chunks_received")
+        self.count("chunk_bytes_received", size)
         return {"index": index, "sha256": sha256, "status": "received"}
 
     def complete_upload(self, principal: Principal, upload_id: str) -> dict:
@@ -325,6 +376,7 @@ class BackupService:
                 conn.execute("UPDATE uploads SET status = 'completed', updated_at = ? WHERE id = ?", (now, upload_id))
                 conn.execute("DELETE FROM upload_chunks WHERE upload_id = ?", (upload_id,))
                 self._audit(conn, "object.stored", principal.user_id, f"{row['object_id']} {total}")
+            self.count("objects_completed")
             shutil.rmtree(self.upload_dir(upload_id), ignore_errors=True)
             return {"status": "completed", "object_id": row["object_id"], "size_bytes": total, "sha256": row["sha256"]}
         finally:
@@ -359,6 +411,47 @@ class BackupService:
                 if active is None:
                     shutil.rmtree(path, ignore_errors=True)
         return len(rows)
+
+    def stats(self, principal: Principal) -> dict:
+        """Upload health for one user plus process-wide counters. Contains counts and
+        sizes only: no object ids, filenames, keys or content."""
+        now = self._now()
+        with self.db.read() as conn:
+            sessions = conn.execute(
+                """SELECT COUNT(*) AS n, COALESCE(SUM(size_bytes),0) AS bytes,
+                          COALESCE(SUM(CASE WHEN updated_at < ? THEN 1 ELSE 0 END),0) AS idle
+                   FROM uploads WHERE user_id = ? AND status = 'active'""",
+                (now - self.settings.abandoned_upload_seconds, principal.user_id),
+            ).fetchone()
+            received = conn.execute(
+                """SELECT COALESCE(SUM(c.size_bytes),0) FROM upload_chunks c JOIN uploads u ON u.id = c.upload_id
+                   WHERE u.user_id = ? AND u.status = 'active'""",
+                (principal.user_id,),
+            ).fetchone()[0]
+            stored = conn.execute(
+                "SELECT COUNT(*) AS n, COALESCE(SUM(size_bytes),0) AS bytes FROM objects WHERE user_id = ?", (principal.user_id,)
+            ).fetchone()
+        with self._metrics_lock:
+            counters = dict(self.metrics)
+        return {
+            "user": {
+                "open_upload_sessions": sessions["n"],
+                "idle_upload_sessions": sessions["idle"],
+                "open_upload_bytes": int(sessions["bytes"]),
+                "open_upload_received_bytes": int(received),
+                "chunk_requests_in_progress": self.chunk_slots.active(str(principal.user_id)),
+                "stored_objects": stored["n"],
+                "stored_bytes": int(stored["bytes"]),
+            },
+            "limits": {
+                "max_open_upload_sessions": self.settings.max_active_uploads_per_user,
+                "max_concurrent_chunk_requests": self.settings.max_inflight_chunks_per_user,
+                "max_chunk_bytes": self.settings.max_chunk_size,
+                "abandoned_upload_seconds": self.settings.abandoned_upload_seconds,
+                "upload_ttl_seconds": self.settings.upload_ttl,
+            },
+            "server": {"chunk_requests_in_progress": self.chunk_slots.total(), **counters},
+        }
 
     # ------------------------------------------------------------- objects
 

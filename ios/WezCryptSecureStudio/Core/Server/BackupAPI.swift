@@ -69,6 +69,9 @@ struct ItemPage: Decodable, Sendable {
 /// password (exchanged for a revocable session token) or a server-issued API key.
 final class BackupAPI: Sendable {
     let configuration: ServerConfiguration
+    /// Back-pressure reported by the server (429/503 + Retry-After), shared by all
+    /// requests made through this client.
+    let pressure = ServerPressure()
     private let credentials: CredentialStore
     private let session: URLSession
     private let loginGate = LoginGate()
@@ -133,10 +136,21 @@ final class BackupAPI: Sendable {
         do {
             let (data, response) = try await session.data(for: request)
             guard let http = response as? HTTPURLResponse else { throw APIError.invalidResponse }
+            observe(http, data: data)
             return (data, http)
         } catch let error as URLError {
             if error.code == .cancelled { throw CancellationError() }
             throw APIError.transport(error)
+        }
+    }
+
+    /// Feeds every response into the shared back-pressure gate.
+    func observe(_ response: HTTPURLResponse, data: Data) {
+        if ServerPressure.isPressure(status: response.statusCode) {
+            let reason = APIError.from(status: response.statusCode, data: data).errorDescription
+            pressure.record(status: response.statusCode, retryAfter: RetryAfter.seconds(from: response), reason: reason)
+        } else if (200..<300).contains(response.statusCode) {
+            pressure.recordSuccess()
         }
     }
 
@@ -215,6 +229,28 @@ final class BackupAPI: Sendable {
 
     func account() async throws -> AccountInfo {
         try await get("/api/v2/me", as: AccountInfo.self)
+    }
+
+    struct UploadStats: Decodable, Sendable {
+        struct User: Decodable, Sendable {
+            let openUploadSessions: Int
+            let idleUploadSessions: Int
+            let chunkRequestsInProgress: Int
+            let storedObjects: Int
+            let storedBytes: Int64
+        }
+        struct Limits: Decodable, Sendable {
+            let maxOpenUploadSessions: Int
+            let maxConcurrentChunkRequests: Int
+        }
+        let user: User
+        let limits: Limits
+    }
+
+    /// Upload-session health on the server (counts only). Servers older than this
+    /// endpoint return 404, which callers treat as "not available".
+    func uploadStats() async throws -> UploadStats {
+        try await get("/api/v2/stats", as: UploadStats.self)
     }
 
     /// Returns nil when no vault fingerprint is registered yet.

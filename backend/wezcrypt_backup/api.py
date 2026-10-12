@@ -14,7 +14,7 @@ from starlette.concurrency import run_in_threadpool
 
 from .auth import AuthService, Principal
 from .config import Settings
-from .errors import APIError, bad_request, too_large, unauthorized
+from .errors import APIError, bad_request, server_busy, too_large, unauthorized
 from .service import HEX64, BackupService
 
 _RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$")
@@ -126,6 +126,11 @@ def parse_range(header: str | None, size: int) -> tuple[int, int] | None:
     return start, end
 
 
+def _flush_and_sync(handle) -> None:
+    handle.flush()
+    os.fsync(handle.fileno())
+
+
 def create_router(settings: Settings, auth: AuthService, service: BackupService) -> APIRouter:
     router = APIRouter(prefix="/api/v2", route_class=make_limited_route(settings.json_body_max_bytes))
 
@@ -151,11 +156,19 @@ def create_router(settings: Settings, auth: AuthService, service: BackupService)
             "max_chunk_bytes": settings.max_chunk_size,
             "max_object_bytes": settings.max_object_size,
             "max_chunks_per_object": settings.max_chunks_per_object,
+            "max_open_upload_sessions": settings.max_active_uploads_per_user,
+            "max_concurrent_chunk_requests": settings.max_inflight_chunks_per_user,
+            "backpressure": "429/503 with Retry-After",
             "upload_ttl_seconds": settings.upload_ttl,
             "range_downloads": True,
             "integrity": "sha256-per-chunk-and-object",
             "transports": ["https"],
         }
+
+    @router.get("/stats")
+    async def stats(p: AuthDep, response: Response) -> dict:
+        response.headers.update(NO_STORE)
+        return await run_in_threadpool(service.stats, p)
 
     # ------------------------------------------------------------------ auth
 
@@ -210,6 +223,20 @@ def create_router(settings: Settings, auth: AuthService, service: BackupService)
         if not x_chunk_sha256 or not HEX64.match(x_chunk_sha256.lower()):
             raise bad_request("checksum_required", "X-Chunk-SHA256 header with the chunk's hex SHA-256 is required")
         declared = x_chunk_sha256.lower()
+        slot_key = str(p.user_id)
+        if not service.chunk_slots.acquire(slot_key):
+            service.count("chunks_rejected_busy")
+            raise server_busy(
+                "too_many_chunk_requests",
+                f"At most {settings.max_inflight_chunks_per_user} chunk uploads may run at the same time; slow down",
+                retry_after=2,
+            )
+        try:
+            return await _receive_chunk(upload_id, index, request, p, declared, content_length)
+        finally:
+            service.chunk_slots.release(slot_key)
+
+    async def _receive_chunk(upload_id: str, index: int, request: Request, p: Principal, declared: str, content_length: int | None) -> dict:
         expected, existing = await run_in_threadpool(service.begin_chunk, p, upload_id, index)
         if content_length is not None and content_length != expected:
             raise bad_request("chunk_size_mismatch", f"chunk {index} must be {expected} bytes")
@@ -218,15 +245,16 @@ def create_router(settings: Settings, auth: AuthService, service: BackupService)
         received = 0
         fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
-            with os.fdopen(fd, "wb") as out:
+            with os.fdopen(fd, "wb", buffering=1024 * 1024) as out:
                 async for piece in request.stream():
                     received += len(piece)
                     if received > expected:
                         raise too_large(f"chunk {index} exceeds {expected} bytes")
                     digest.update(piece)
                     out.write(piece)
-                out.flush()
-                os.fsync(out.fileno())
+                # Flushing to disk can take a while for a large chunk; do it off the
+                # event loop so other requests are not stalled.
+                await run_in_threadpool(_flush_and_sync, out)
             if received != expected:
                 raise bad_request("chunk_truncated", f"chunk {index} must be {expected} bytes, received {received}")
             if digest.hexdigest() != declared:

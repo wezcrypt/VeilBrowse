@@ -42,29 +42,29 @@ struct SyncSnapshot: Sendable, Equatable {
     var counts = QueueCounts()
     var active: [ActiveTransfer] = []
     var bytesPerSecond: Double = 0
+    /// Average over the last two minutes; used for the time estimate.
+    var averageBytesPerSecond: Double = 0
     var sessionBytes: Int64 = 0
     var remainingBytes: Int64 = 0
+    /// Plaintext bytes already backed up from this device.
+    var uploadedBytes: Int64 = 0
     var etaSeconds: Double?
+    /// Parallel uploads allowed by device conditions and settings.
     var concurrency = 0
+    /// Parallel uploads currently used (adaptive, never above `concurrency`).
+    var adaptiveLimit = 1
+    var activeConnections = 0
+    var openServerSessions = 0
     var blockReason: String?
+    /// Set while the server asked us to slow down (HTTP 429/503).
+    var serverBusyUntil: Date?
+    var serverBusyReason: String?
+    /// Chunks postponed because of server pressure (not counted as failures).
+    var deferredByServer = 0
+    var waitingRetryAssets = 0
+    var waitingRetryChunks = 0
     var lastError: String?
     var isRunning = false
-}
-
-struct ThroughputMeter: Sendable {
-    private var samples: [(Date, Int64)] = []
-    var window: TimeInterval = 10
-
-    mutating func add(_ bytes: Int64, at date: Date = Date()) {
-        samples.append((date, bytes))
-        samples.removeAll { date.timeIntervalSince($0.0) > window }
-    }
-
-    mutating func rate(now: Date = Date()) -> Double {
-        samples.removeAll { now.timeIntervalSince($0.0) > window }
-        guard let first = samples.first else { return 0 }
-        return Double(samples.reduce(Int64(0)) { $0 + $1.1 }) / max(now.timeIntervalSince(first.0), 1)
-    }
 }
 
 struct SyncEnvironment: Sendable {
@@ -113,12 +113,17 @@ actor SyncEngine {
     private var snapshot = SyncSnapshot()
     private var active: [String: ActiveTransfer] = [:]
     private var meter = ThroughputMeter()
+    private var adaptive = AdaptiveConcurrency(ceiling: 4)
+    private var deferred = Set<String>()
+    /// Items encrypted ahead of the upload: bounded by count as well as bytes, so the
+    /// queue on disk (and the work lost if iOS kills the app) stays small.
+    var maxPreparedAssets = 24
     private var continuations: [UUID: AsyncStream<SyncSnapshot>.Continuation] = [:]
     private var lastPublish = Date.distantPast
     private var publishPending = false
 
     /// Maximum encrypted bytes waiting on disk before preparation pauses.
-    var preparedWindow: Int64 = 1_500_000_000
+    var preparedWindow: Int64 = 512_000_000
 
     init(store: QueueStore, keyVault: KeyVault, transport: ChunkTransport, network: NetworkMonitor,
          environment: SyncEnvironment, directories: SyncDirectories, storage: StorageGuard = StorageGuard()) {
@@ -237,6 +242,12 @@ actor SyncEngine {
     func refreshCounts() async {
         if let counts = try? await store.counts() { snapshot.counts = counts }
         snapshot.remainingBytes = (try? await store.remainingBytesEstimate()) ?? snapshot.remainingBytes
+        snapshot.uploadedBytes = (try? await store.completedBytes()) ?? snapshot.uploadedBytes
+        snapshot.openServerSessions = (try? await store.openSessionCount()) ?? snapshot.openServerSessions
+        if let waiting = try? await store.waitingRetryCounts() {
+            snapshot.waitingRetryAssets = waiting.assets
+            snapshot.waitingRetryChunks = waiting.chunks
+        }
         publish()
     }
 
@@ -260,6 +271,8 @@ actor SyncEngine {
             }
             try await recover(api: api)
             await refreshCounts()
+            adaptive = AdaptiveConcurrency(start: 1, ceiling: max(1, settings.maxConcurrency))
+            deferred.removeAll()
             try await process(api: api)
             try Task.checkCancellation()
             await refreshCounts()
@@ -317,13 +330,13 @@ actor SyncEngine {
     /// may have finished while the app was not running).
     private func recover(api: BackupAPI) async throws {
         deleteChunkFiles(try await store.resetInterruptedPreparation())
-        for object in try await store.objectsNeedingUpload() {
+        for object in try await store.objectsNeedingUpload() where object.uploadID != nil {
             try Task.checkCancellation()
             do {
                 try await ensureUpload(object, api: api)
             } catch let error as APIError where !error.isRetryable && error.status != 401 {
                 Log.sync.notice("Re-preparing asset after server error \(error.code ?? "", privacy: .public)")
-                deleteChunkFiles(try await store.requeue(object.localID, error: error.localizedDescription, retryAfter: nil, countAttempt: true))
+                try await requeueReleasingSessions(object.localID, error: error.localizedDescription, retryAfter: nil, countAttempt: true, api: api)
             }
         }
         for localID in try await store.assetsAwaitingFinalization() {
@@ -370,7 +383,7 @@ actor SyncEngine {
 
     private enum Outcome: Sendable {
         case prepared(String)
-        case chunk(QueueChunk, Result<Void, Error>)
+        case chunk(QueueChunk, Result<Bool, Error>)
     }
 
     private func process(api: BackupAPI) async throws {
@@ -383,17 +396,32 @@ actor SyncEngine {
                 let settings = await environment.settings()
                 let conditions = await environment.conditions()
                 let decision = TransferPolicy.decide(settings: settings, conditions: conditions)
+                adaptive.setCeiling(max(1, decision.concurrency))
                 snapshot.concurrency = decision.concurrency
+                snapshot.adaptiveLimit = adaptive.limit
                 snapshot.blockReason = decision.blockReason
+                let busyUntil = api.pressure.blockedUntil()
+                snapshot.serverBusyUntil = busyUntil
+                snapshot.serverBusyReason = busyUntil == nil ? nil : api.pressure.state.lastReason
+                if busyUntil == nil { deferred.removeAll() }
+                snapshot.deferredByServer = deferred.count
 
                 if decision.isBlocked && inFlight.isEmpty && !preparing {
                     setPhase(.waiting(decision.blockReason ?? ""))
                     try await waitForConditionsChange(conditions.network)
                     continue
                 }
+                // Server back-pressure: nothing new is sent until Retry-After has passed.
+                if let busyUntil, inFlight.isEmpty, !preparing {
+                    setPhase(.waiting(String(localized: "Server is busy — resuming at \(busyUntil.formatted(date: .omitted, time: .standard))")))
+                    try await Task.sleep(nanoseconds: UInt64(max(busyUntil.timeIntervalSinceNow, 0.5) * 1_000_000_000))
+                    continue
+                }
                 if snapshot.phase != .running { setPhase(.running) }
 
-                if !preparing, !decision.isBlocked, try await store.pendingChunkBytes() < preparedWindow,
+                if !preparing, !decision.isBlocked, busyUntil == nil,
+                   try await store.pendingChunkBytes() < preparedWindow,
+                   try await store.inFlightAssetCount() < maxPreparedAssets,
                    let asset = try await store.nextPendingAsset(kinds: kinds(settings)) {
                     preparing = true
                     try await store.markPreparing(asset.localID)
@@ -404,14 +432,17 @@ actor SyncEngine {
                     }
                 }
 
-                let capacity = decision.concurrency - inFlight.count
+                // One global limit for every chunk request of this device: the smaller of
+                // what conditions allow and what the server has proven it can take.
+                let capacity = busyUntil == nil ? min(decision.concurrency, adaptive.limit) - inFlight.count : 0
+                snapshot.activeConnections = inFlight.count
                 if capacity > 0 {
                     for chunk in try await store.pendingChunks(limit: capacity, excluding: inFlight) {
                         inFlight.insert(chunk.key)
                         group.addTask { [self] in
                             do {
-                                try await self.upload(chunk, api: api)
-                                return .chunk(chunk, .success(()))
+                                let sent = try await self.upload(chunk, api: api)
+                                return .chunk(chunk, .success(sent))
                             } catch {
                                 return .chunk(chunk, .failure(error))
                             }
@@ -423,8 +454,8 @@ actor SyncEngine {
                     let assetRetry = try await store.earliestRetry()
                     let chunkRetry = try await store.earliestChunkRetry()
                     let retries = [assetRetry, chunkRetry].compactMap { $0 }
-                    if let next = retries.min(), next.timeIntervalSinceNow < 300 {
-                        setPhase(.waiting(String(localized: "Retrying shortly")))
+                    if let next = retries.min(), next.timeIntervalSinceNow < 900 {
+                        setPhase(.waiting(String(localized: "Retrying at \(next.formatted(date: .omitted, time: .standard))")))
                         try await Task.sleep(nanoseconds: UInt64(max(next.timeIntervalSinceNow, 1) * 1_000_000_000))
                         continue
                     }
@@ -437,6 +468,7 @@ actor SyncEngine {
                     preparing = false
                 case .chunk(let chunk, let result):
                     inFlight.remove(chunk.key)
+                    snapshot.activeConnections = inFlight.count
                     try await handleChunkResult(chunk, result: result, api: api)
                 }
                 await refreshCounts()
@@ -519,24 +551,14 @@ actor SyncEngine {
                 return
             }
 
+            // No server session is opened here. Sessions are opened lazily, one object at a
+            // time, when its first chunk is about to be sent (see `session(for:api:)`), so
+            // encrypting ahead never ties up server resources.
             await track(asset.localID, name: displayName ?? asset.kind.title, stage: .uploading, total: exported.totalSize)
-            for index in objects.indices {
-                let object = objects[index].0
-                let session = try await api.createUpload(objectID: object.objectID, sizeBytes: object.cipherSize, chunkSize: object.chunkSize,
-                                                         chunkCount: object.chunkCount, sha256: object.cipherSHA256)
-                objects[index].0.uploadID = session.uploadId
-                objects[index].0.completed = session.status == "completed"
-            }
             let itemID = WZCE.randomBytes(16)
             let item = PreparedItem(localID: asset.localID, itemID: itemID.hexString, kind: exported.kind,
                                     manifest: try manifest.sealed(itemID: itemID, keys: keys), contentTag: tag, objectIDs: objects.map(\.0.objectID))
             try await store.savePrepared(item, displayName: displayName, totalBytes: exported.totalSize, objects: objects)
-            for (object, _) in objects where object.completed {
-                deleteChunkFiles(try await store.markObjectCompleted(object.objectID))
-            }
-            if try await store.remainingObjects(localID: asset.localID) == 0 {
-                try await finalize(asset.localID, api: api)
-            }
         } catch {
             Self.deleteFiles(producedChunks.map(\.url))
             await prepareFailed(asset.localID, error: error)
@@ -570,6 +592,9 @@ actor SyncEngine {
             } else if case StorageError.lowStorage = error {
                 deleteChunkFiles(try await store.requeue(localID, error: message, retryAfter: Date().addingTimeInterval(600), countAttempt: false))
                 snapshot.lastError = message
+            } else if let apiError = error as? APIError, let status = apiError.status, ServerPressure.isPressure(status: status) {
+                let until = api?.pressure.blockedUntil() ?? Date().addingTimeInterval(Backoff(base: 5, maximum: 300).delay(forAttempt: 1))
+                deleteChunkFiles(try await store.requeue(localID, error: message, retryAfter: until, countAttempt: false))
             } else if let export = error as? ExportError, export == .assetNotFound || export == .noOriginal {
                 deleteChunkFiles(try await store.markFailed(localID, error: message))
             } else if Self.isRetryable(error) {
@@ -609,10 +634,14 @@ actor SyncEngine {
 
     // MARK: - Chunk upload
 
-    private nonisolated func upload(_ chunk: QueueChunk, api: BackupAPI) async throws {
-        guard let uploadID = chunk.uploadID else { throw APIError.invalidResponse }
+    /// Returns true when bytes were sent, false when nothing had to be sent (the server
+    /// already had the chunk or the whole object).
+    private nonisolated func upload(_ chunk: QueueChunk, api: BackupAPI) async throws -> Bool {
         let fileURL = dirs.chunks.appendingPathComponent(chunk.fileName)
         guard FileManager.default.fileExists(atPath: fileURL.path) else { throw ChunkFileMissing() }
+        let resolved: String?
+        if let existing = chunk.uploadID { resolved = existing } else { resolved = try await session(for: chunk, api: api) }
+        guard let uploadID = resolved else { return false }
         var (response, body) = try await transport.upload(
             try api.chunkRequest(uploadID: uploadID, index: chunk.index, sha256: chunk.sha256, token: try await api.bearerToken()), fromFile: fileURL)
         if response.statusCode == 401 {
@@ -620,20 +649,61 @@ actor SyncEngine {
             (response, body) = try await transport.upload(
                 try api.chunkRequest(uploadID: uploadID, index: chunk.index, sha256: chunk.sha256, token: try await api.bearerToken()), fromFile: fileURL)
         }
+        api.observe(response, data: body)
         guard (200..<300).contains(response.statusCode) else { throw APIError.from(status: response.statusCode, data: body) }
+        return true
+    }
+
+    /// Opens (or resumes) the server session for a chunk's object right before its
+    /// first chunk is sent. Idempotent: the server returns the same session for the
+    /// same object, so two chunks of one object racing here cannot open two sessions.
+    /// Returns nil when nothing needs to be sent for this chunk.
+    private func session(for chunk: QueueChunk, api: BackupAPI) async throws -> String? {
+        guard let object = try await store.object(chunk.objectID), !object.completed else { return nil }
+        if let uploadID = object.uploadID { return uploadID }
+        try await ensureUpload(object, api: api)
+        guard let refreshed = try await store.object(chunk.objectID), !refreshed.completed,
+              !(try await store.isChunkDone(objectID: chunk.objectID, index: chunk.index)) else { return nil }
+        snapshot.openServerSessions = (try? await store.openSessionCount()) ?? snapshot.openServerSessions
+        return refreshed.uploadID
+    }
+
+    /// Cancels server sessions of an asset that is being re-prepared or has failed,
+    /// so abandoned sessions never accumulate on the server. Best effort.
+    private func releaseServerSessions(_ uploadIDs: [String], api: BackupAPI) {
+        guard !uploadIDs.isEmpty else { return }
+        Task.detached(priority: .utility) {
+            for uploadID in uploadIDs { try? await api.cancelUpload(uploadID) }
+        }
+    }
+
+    private func requeueReleasingSessions(_ localID: String, error: String?, retryAfter: Date?, countAttempt: Bool, api: BackupAPI) async throws {
+        let sessions = (try? await store.openUploadIDs(localID: localID)) ?? []
+        deleteChunkFiles(try await store.requeue(localID, error: error, retryAfter: retryAfter, countAttempt: countAttempt))
+        releaseServerSessions(sessions, api: api)
+    }
+
+    private func failReleasingSessions(_ localID: String, error: String, api: BackupAPI) async throws {
+        let sessions = (try? await store.openUploadIDs(localID: localID)) ?? []
+        deleteChunkFiles(try await store.markFailed(localID, error: error))
+        releaseServerSessions(sessions, api: api)
     }
 
     struct ChunkFileMissing: Error, LocalizedError {
         var errorDescription: String? { String(localized: "A prepared upload file is missing; the item will be encrypted again.") }
     }
 
-    private func handleChunkResult(_ chunk: QueueChunk, result: Result<Void, Error>, api: BackupAPI) async throws {
+    private func handleChunkResult(_ chunk: QueueChunk, result: Result<Bool, Error>, api: BackupAPI) async throws {
         guard let object = try await store.object(chunk.objectID) else { return }
         switch result {
-        case .success:
+        case .success(let sent):
+            deferred.remove(chunk.key)
             try await store.markChunkDone(objectID: chunk.objectID, index: chunk.index)
-            meter.add(Int64(chunk.size))
-            snapshot.sessionBytes += Int64(chunk.size)
+            if sent {
+                adaptive.success()
+                meter.add(Int64(chunk.size))
+                snapshot.sessionBytes += Int64(chunk.size)
+            }
             if var transfer = active[object.localID] {
                 transfer.sentBytes += Int64(chunk.size)
                 transfer.stage = .uploading
@@ -655,24 +725,35 @@ actor SyncEngine {
             let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             let apiError = error as? APIError
             let corrupt = error is ChunkFileMissing || ["checksum_mismatch", "chunk_conflict", "chunk_size_mismatch", "chunk_truncated"].contains(apiError?.code ?? "")
-            if corrupt || apiError?.status == 410 || apiError?.status == 404 {
+            if let status = apiError?.status, ServerPressure.isPressure(status: status) {
+                // Back-pressure is not a failure of this chunk: halve parallelism, wait
+                // for Retry-After (the gate is shared by every request), keep attempts.
+                adaptive.pressure()
+                let until = api.pressure.blockedUntil() ?? Date().addingTimeInterval(Backoff(base: 2, maximum: 300).delay(forAttempt: 1))
+                try await store.deferChunk(objectID: chunk.objectID, index: chunk.index, until: until)
+                deferred.insert(chunk.key)
+                Log.sync.notice("Server busy (HTTP \(status, privacy: .public)); waiting \(Int(max(until.timeIntervalSinceNow, 0)), privacy: .public) s")
+            } else if corrupt || apiError?.status == 410 || apiError?.status == 404 {
                 Log.sync.notice("Re-preparing item after chunk error: \(message, privacy: .public)")
                 active.removeValue(forKey: object.localID)
-                deleteChunkFiles(try await store.requeue(object.localID, error: message, retryAfter: nil, countAttempt: true))
+                try await requeueReleasingSessions(object.localID, error: message, retryAfter: nil, countAttempt: true, api: api)
             } else if Self.isRetryable(error) {
+                adaptive.failure()
                 let attempts = try await store.markChunkRetry(objectID: chunk.objectID, index: chunk.index,
                                                               retryAfter: Date().addingTimeInterval(Backoff(base: 2, maximum: 300).delay(forAttempt: chunk.attempts + 1)))
                 try await store.noteError(object.localID, message)
                 if attempts >= AppConfig.maxAttempts * 2 {
                     active.removeValue(forKey: object.localID)
-                    deleteChunkFiles(try await store.markFailed(object.localID, error: message))
+                    try await failReleasingSessions(object.localID, error: message, api: api)
                 }
             } else {
                 active.removeValue(forKey: object.localID)
-                deleteChunkFiles(try await store.markFailed(object.localID, error: message))
+                try await failReleasingSessions(object.localID, error: message, api: api)
             }
             snapshot.lastError = message
         }
+        snapshot.adaptiveLimit = adaptive.limit
+        snapshot.deferredByServer = deferred.count
     }
 
     /// Asks the server to assemble the object and verify its SHA-256; only then is it considered stored.
@@ -692,7 +773,7 @@ actor SyncEngine {
             try await store.reopenChunks(objectID: objectID, indices: error.missingIndices)
         } catch let error as APIError where error.code == "object_hash_mismatch" || error.status == 410 {
             active.removeValue(forKey: object.localID)
-            deleteChunkFiles(try await store.requeue(object.localID, error: error.localizedDescription, retryAfter: nil, countAttempt: true))
+            try await requeueReleasingSessions(object.localID, error: error.localizedDescription, retryAfter: nil, countAttempt: true, api: api)
         }
     }
 
@@ -769,8 +850,8 @@ actor SyncEngine {
         publishPending = false
         snapshot.active = active.values.sorted { $0.id < $1.id }
         snapshot.bytesPerSecond = meter.rate(now: now)
-        snapshot.etaSeconds = snapshot.bytesPerSecond > 1024 && snapshot.remainingBytes > 0
-            ? Double(snapshot.remainingBytes) / snapshot.bytesPerSecond : nil
+        snapshot.averageBytesPerSecond = meter.averageRate(now: now)
+        snapshot.etaSeconds = TransferEstimate.eta(remainingBytes: snapshot.remainingBytes, averageBytesPerSecond: snapshot.averageBytesPerSecond)
         for continuation in continuations.values { continuation.yield(snapshot) }
     }
 
