@@ -91,11 +91,12 @@ cmp -s <(unzip -p "$IPA" "Payload/$APP_NAME.app/$APP_NAME") "$BIN" || fail "zipp
 IPA_BYTES=$(stat -f %z "$IPA")
 (( IPA_BYTES >= MIN_IPA_BYTES )) || fail "IPA is only $IPA_BYTES bytes"
 FILE_COUNT=$(grep -cv '/$' <<<"$ENTRIES")
+IPA_MIB=$(awk -v bytes="$IPA_BYTES" 'BEGIN { printf "%.2f", bytes / 1048576 }')
 
 {
   echo "WezCrypt Secure Studio — build $BUILD (${GITHUB_SHA:-local})"
   echo "IPA:                         $IPA_NAME"
-  echo "IPA size:                    $IPA_BYTES bytes ($(awk "BEGIN{printf \"%.2f\", $IPA_BYTES/1048576}") MiB)"
+  echo "IPA size:                    $IPA_BYTES bytes ($IPA_MIB MiB)"
   echo "Files in Payload:            $FILE_COUNT"
   echo "Executable size:             $BIN_BYTES bytes"
   echo "CFBundleIdentifier:          $(plist CFBundleIdentifier)"

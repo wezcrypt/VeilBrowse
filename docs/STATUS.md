@@ -26,7 +26,15 @@ This file separates **written**, **tested in CI** and **not tested**. Nothing he
 | iOS #5 | IPA ✅ · tests ⏹ | Superseded by the next push |
 | iOS #6 | IPA ✅ · tests ❌ | 24 passed; 19 failed with `errSecMissingEntitlement (-34018)`: the simulator build was unsigned, so it had no Keychain access |
 | iOS #7 | IPA ✅ · tests ❌ | Ad-hoc signed: Keychain fixed. 4 failed with HTTP 429: the backend counted *successful* logins toward the rate limit (real bug, fixed). PhotoKit test skipped because the Photos grant was applied before install |
-| iOS #8 | see Actions | Rate limiter counts failures only; install → grant Photos → test-without-building |
+| iOS #8–9 | ⏹ | Superseded |
+| iOS #10 (`5a8f5b4`, run 38252393229) | ✅ all jobs | **42 tests passed, 0 failed, 1 skipped** (PhotoKit: the simulator still reports Photos access as not granted). IPA packaging rewritten (no AppleDouble/`__MACOSX` entries, strict structure checks); release **build-10** published |
+
+### Release build-10 (verified by downloading it from the public release URL)
+
+- `WezCryptSecureStudio-2.0.0-10-unsigned.ipa`, 749,291 bytes, SHA-256 `909e415c6ebbba56125404469836b9a85abe5efd68717f3bd54ff41032ab298f`
+- `unzip -t` OK; only `Payload/WezCryptSecureStudio.app/` entries: executable (1,674,256 B, Mach-O arm64, LC_BUILD_VERSION platform 2 = iOS device), Info.plist, Assets.car, AppIcon60x60@2x.png (120×120), AppIcon76x76@2x~ipad.png, PkgInfo
+- Info.plist: `com.wezcrypt.securestudio`, 2.0.0 (10), MinimumOSVersion 17.0, DTPlatformName iphoneos
+- Unsigned: it must be signed (e.g. KravaSigner) before installation. Installing on a device has not been tested from here.
 | Backend #3 | ✅ | pytest on Python 3.12 and 3.13 |
 
 ## Test coverage map
